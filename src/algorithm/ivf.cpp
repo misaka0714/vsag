@@ -259,6 +259,9 @@ IVF::IVF(const IVFParameterPtr& param, const IndexCommonParam& common_param)
             FlattenInterface::MakeInstance(param->precise_codes_param, common_param);
         reorder_ = std::make_shared<FlattenReorder>(this->reorder_codes_, allocator_);
     }
+    if (param->bucket_param->use_residual_) {
+        this->bucket_->SetStrategy(partition_strategy_);
+    }
 
     this->thread_pool_ = common_param.thread_pool_;
     if (param->build_thread_count > 1 and this->thread_pool_ == nullptr) {
