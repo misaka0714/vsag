@@ -30,8 +30,18 @@ IVFParameter::FromJson(const JsonType& json) {
     }
 
     this->bucket_param = std::make_shared<BucketDataCellParameter>();
+
+    if (json.Contains(IVF_TRAIN_SAMPLE_COUNT_KEY)) {
+        this->train_sample_count = json[IVF_TRAIN_SAMPLE_COUNT_KEY].GetInt();
+        CHECK_ARGUMENT(
+            this->train_sample_count >= 512,
+            fmt::format("ivf_train_sample_count must be greater than or equal to 512, got: {}",
+                        this->train_sample_count));
+    }
+
     CHECK_ARGUMENT(json.Contains(BUCKET_PARAMS_KEY),
                    fmt::format("ivf parameters must contains {}", BUCKET_PARAMS_KEY));
+
     this->bucket_param->FromJson(json[BUCKET_PARAMS_KEY]);
 
     this->ivf_partition_strategy_parameter = std::make_shared<IVFPartitionStrategyParameters>();
@@ -55,6 +65,7 @@ IVFParameter::ToJson() const {
     json[IVF_PARTITION_STRATEGY_PARAMS_KEY].SetJson(
         this->ivf_partition_strategy_parameter->ToJson());
     json[BUCKET_PER_DATA_KEY].SetInt(this->buckets_per_data);
+    json[IVF_TRAIN_SAMPLE_COUNT_KEY].SetInt(this->train_sample_count);
     return json;
 }
 bool
@@ -78,6 +89,10 @@ IVFParameter::CheckCompatibility(const ParamPtr& other) const {
         return false;
     }
 
+    if (this->train_sample_count != ivf_param->train_sample_count) {
+        logger::error("IVFParameter::CheckCompatibility: train_sample_count mismatch");
+        return false;
+    }
     if (not this->ivf_partition_strategy_parameter->CheckCompatibility(
             ivf_param->ivf_partition_strategy_parameter)) {
         logger::error(
