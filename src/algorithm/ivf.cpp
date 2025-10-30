@@ -262,7 +262,6 @@ IVF::IVF(const IVFParameterPtr& param, const IndexCommonParam& common_param)
     if (param->bucket_param->use_residual_) {
         this->bucket_->SetStrategy(partition_strategy_);
     }
-
     this->thread_pool_ = common_param.thread_pool_;
     if (param->build_thread_count > 1 and this->thread_pool_ == nullptr) {
         this->thread_pool_ = SafeThreadPool::FactoryDefaultThreadPool();
