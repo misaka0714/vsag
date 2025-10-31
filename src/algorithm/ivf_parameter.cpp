@@ -89,10 +89,6 @@ IVFParameter::CheckCompatibility(const ParamPtr& other) const {
         return false;
     }
 
-    if (this->train_sample_count != ivf_param->train_sample_count) {
-        logger::error("IVFParameter::CheckCompatibility: train_sample_count mismatch");
-        return false;
-    }
     if (not this->ivf_partition_strategy_parameter->CheckCompatibility(
             ivf_param->ivf_partition_strategy_parameter)) {
         logger::error(
