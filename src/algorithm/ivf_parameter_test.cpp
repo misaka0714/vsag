@@ -232,7 +232,7 @@ TEST_CASE("IVF Parameters Train Sample Count Invalid Value Test",
     vsag::JsonType param_json = vsag::JsonType::Parse(modified_param_str);
     auto param = std::make_shared<vsag::IVFParameter>();
 
-    REQUIRE_THROWS_AS(param->FromJson(param_json), std::invalid_argument);
+    REQUIRE_THROWS_AS(param->FromJson(param_json), vsag::VsagException);
 }
 
 TEST_CASE("IVF Sampling Logic Test", "[ut][IVFParameter][sampling]") {
