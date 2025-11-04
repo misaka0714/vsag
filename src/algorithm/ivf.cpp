@@ -347,46 +347,6 @@ IVF::Build(const DatasetPtr& base) {
     auto result = this->Add(base);
     return result;
 }
-namespace {
-
-// Generate random sampling index
-vsag::Vector<int64_t>
-sample_indices_random(int64_t total_size,
-                      int64_t sample_count,
-                      std::shared_ptr<Allocator> allocator) {
-    //  Reservoir sampling: only save sample_count elements
-    vsag::Vector<int64_t> indices(allocator.get());
-    indices.reserve(sample_count);
-
-    int64_t actual_size = std::min(sample_count, total_size);
-    indices.resize(actual_size);
-    std::iota(indices.begin(), indices.end(), 0);
-
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-
-    //Scan the remaining elements in sequence to replace the samples in the reservoir with probabilities
-    for (int64_t i = sample_count; i < total_size; ++i) {
-        std::uniform_int_distribution<int64_t> dist(0, i);
-        int64_t j = dist(gen);
-        if (j < sample_count) {
-            indices[j] = i;
-        }
-    }
-
-    return indices;
-}
-
-// Calculate the actual number of samples based on the sampling rate or quantity
-int64_t
-calculate_sample_count(int64_t total_size, int64_t sample_count) {
-    if (sample_count >= MIN_TRAIN_SIZE) {
-        return std::min(sample_count, total_size);
-    } else
-        return MIN_TRAIN_SIZE;
-}
-
-}  // anonymous namespace
 
 void
 IVF::Train(const DatasetPtr& data) {
@@ -395,56 +355,10 @@ IVF::Train(const DatasetPtr& data) {
     }
 
     int64_t total_elements = data->GetNumElements();
+    int64_t dim = data->GetDim();
+    DatasetPtr train_data = SampleTrainingData(data, total_elements, dim);
+    int64_t sample_count = train_data->GetNumElements();
 
-    // calculate sample count
-    int64_t sample_count = calculate_sample_count(total_elements, train_sample_count_);
-
-    // Not exceeding the maximum training data limit
-    sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
-
-    DatasetPtr train_data = data;
-    Vector<float> sampled_data_buffer(allocator_);
-    Vector<int64_t> sampled_ids(allocator_);  // Move to outer scope to extend lifetime
-
-    // If sampling is needed and the sample count is less than the total data size
-    if (sample_count < total_elements) {
-        // Generate random sampling indices
-        auto sampled_indices =
-            sample_indices_random(total_elements,
-                                  sample_count,
-                                  std::shared_ptr<Allocator>(allocator_, [](Allocator*) {}));
-
-        // Create a new dataset for training using the sampled data
-        sampled_data_buffer.resize(sample_count * dim_);
-        const auto* original_data = data->GetFloat32Vectors();
-
-        // Copy the sampled data
-        for (int64_t i = 0; i < sample_count; ++i) {
-            std::copy(original_data + sampled_indices[i] * dim_,
-                      original_data + (sampled_indices[i] + 1) * dim_,
-                      sampled_data_buffer.data() + i * dim_);
-        }
-
-        // Create a new dataset for training using the sampled data
-        auto sampled_dataset = std::make_shared<DatasetImpl>();
-        sampled_dataset->NumElements(sample_count)
-            ->Dim(dim_)
-            ->Float32Vectors(sampled_data_buffer.data())
-            ->Owner(false);
-
-        if (data->GetIds() != nullptr) {
-            sampled_ids.reserve(sample_count);
-            const auto* original_ids = data->GetIds();
-            for (int64_t i = 0; i < sample_count; ++i) {
-                sampled_ids.push_back(original_ids[sampled_indices[i]]);
-            }
-            sampled_dataset->Ids(sampled_ids.data())->Owner(false);
-        }
-
-        train_data = sampled_dataset;
-    }
-
-    // Use the sampled data to train the partition strategy
     partition_strategy_->Train(train_data);
 
     const auto* data_ptr = train_data->GetFloat32Vectors();
@@ -454,6 +368,69 @@ IVF::Train(const DatasetPtr& data) {
         this->reorder_codes_->Train(data->GetFloat32Vectors(), data->GetNumElements());
     }
     this->is_trained_ = true;
+}
+
+DatasetPtr
+IVF::SampleTrainingData(const DatasetPtr& data, int64_t total_elements, int64_t dim) {
+    int64_t sample_count;
+    if (train_sample_count_ >= MIN_TRAIN_SIZE) {
+        sample_count = std::min(train_sample_count_, total_elements);
+    } else {
+        sample_count = MIN_TRAIN_SIZE;
+    }
+
+    sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
+
+    // If no sampling is needed, return the original dataset
+    if (sample_count >= total_elements) {
+        return data;
+    }
+
+    Vector<float> sampled_data_buffer(allocator_);
+    Vector<int64_t> sampled_ids(allocator_);
+
+    vsag::Vector<int64_t> sampled_indices(allocator_);
+    sampled_indices.reserve(sample_count);
+    int64_t actual_size = std::min(sample_count, total_elements);
+    sampled_indices.resize(actual_size);
+    std::iota(sampled_indices.begin(), sampled_indices.end(), 0);
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+
+    for (int64_t i = sample_count; i < total_elements; ++i) {
+        std::uniform_int_distribution<int64_t> dist(0, i);
+        int64_t j = dist(gen);
+        if (j < sample_count) {
+            sampled_indices[j] = i;
+        }
+    }
+
+    sampled_data_buffer.resize(sample_count * dim);
+    const auto* original_data = data->GetFloat32Vectors();
+
+    for (int64_t i = 0; i < sample_count; ++i) {
+        std::copy(original_data + sampled_indices[i] * dim,
+                  original_data + (sampled_indices[i] + 1) * dim,
+                  sampled_data_buffer.data() + i * dim);
+    }
+
+    auto sampled_dataset = std::make_shared<DatasetImpl>();
+    sampled_dataset->NumElements(sample_count)
+        ->Dim(dim)
+        ->Float32Vectors(sampled_data_buffer.data())
+        ->Owner(false);
+
+    if (data->GetIds() != nullptr) {
+        sampled_ids.reserve(sample_count);
+        const auto* original_ids = data->GetIds();
+        for (int64_t i = 0; i < sample_count; ++i) {
+            sampled_ids.push_back(original_ids[sampled_indices[i]]);
+        }
+        sampled_dataset->Ids(sampled_ids.data())->Owner(false);
+    }
+
+    return sampled_dataset;
 }
 
 std::vector<int64_t>
