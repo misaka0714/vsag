@@ -37,6 +37,10 @@ IVFParameter::FromJson(const JsonType& json) {
             this->train_sample_count >= 512,
             fmt::format("ivf_train_sample_count must be greater than or equal to 512, got: {}",
                         this->train_sample_count));
+        CHECK_ARGUMENT(
+            this->train_sample_count <= 65536L,
+            fmt::format("ivf_train_sample_count must be less than or equal to 65536, got: {}",
+                        this->train_sample_count));
     }
 
     CHECK_ARGUMENT(json.Contains(BUCKET_PARAMS_KEY),
