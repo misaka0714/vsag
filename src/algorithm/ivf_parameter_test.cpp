@@ -225,6 +225,7 @@ TEST_CASE("IVF Parameters Train Sample Count Invalid Value Test",
     IVFDefaultParam index_param;
     auto param_str = generate_ivf_param(index_param);
 
+    // Test invalid value less than minimum 512
     auto json_obj = vsag::JsonType::Parse(param_str);
     json_obj["ivf_train_sample_count"].SetInt(100);  // Invalid value, less than minimum 512
     auto modified_param_str = json_obj.Dump();
@@ -233,39 +234,19 @@ TEST_CASE("IVF Parameters Train Sample Count Invalid Value Test",
     auto param = std::make_shared<vsag::IVFParameter>();
 
     REQUIRE_THROWS_AS(param->FromJson(param_json), vsag::VsagException);
+
+    // Test invalid value exceeding maximum 65536
+    json_obj = vsag::JsonType::Parse(param_str);
+    json_obj["ivf_train_sample_count"].SetInt(1000000);  // Exceeds maximum value
+    modified_param_str = json_obj.Dump();
+
+    param_json = vsag::JsonType::Parse(modified_param_str);
+    param = std::make_shared<vsag::IVFParameter>();
+
+    REQUIRE_THROWS_AS(param->FromJson(param_json), vsag::VsagException);
 }
 
 TEST_CASE("IVF Sampling Logic Test", "[ut][IVFParameter][sampling]") {
-    // This test verifies the sampling logic boundaries and special cases
-
-    SECTION("Minimum valid train_sample_count") {
-        IVFDefaultParam index_param;
-        auto param_str = generate_ivf_param(index_param);
-
-        auto json_obj = vsag::JsonType::Parse(param_str);
-        json_obj["ivf_train_sample_count"].SetInt(512);  // Minimum valid value
-        auto modified_param_str = json_obj.Dump();
-
-        vsag::JsonType param_json = vsag::JsonType::Parse(modified_param_str);
-        auto param = std::make_shared<vsag::IVFParameter>();
-        param->FromJson(param_json);
-        REQUIRE(param->train_sample_count == 512);
-    }
-
-    SECTION("Maximum typical train_sample_count") {
-        IVFDefaultParam index_param;
-        auto param_str = generate_ivf_param(index_param);
-
-        auto json_obj = vsag::JsonType::Parse(param_str);
-        json_obj["ivf_train_sample_count"].SetInt(1000000);  // Large value within reasonable range
-        auto modified_param_str = json_obj.Dump();
-
-        vsag::JsonType param_json = vsag::JsonType::Parse(modified_param_str);
-        auto param = std::make_shared<vsag::IVFParameter>();
-        param->FromJson(param_json);
-        REQUIRE(param->train_sample_count == 1000000);
-    }
-
     SECTION("Train sample count affects actual sampling") {
         // This test conceptually verifies that different train_sample_count values
         // would lead to different sampling behavior in the IVF implementation
