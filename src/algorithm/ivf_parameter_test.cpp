@@ -273,6 +273,9 @@ TEST_CASE("IVF Sampling Logic Test", "[ut][IVFParameter][sampling]") {
 }
 
 TEST_CASE("SampleTrainingData Function Test", "[ut][SampleTrainingData]") {
+    // Create allocator
+    auto allocator = vsag::SafeAllocator::FactoryDefaultAllocator();
+
     // Test with small dataset that should not be sampled
     auto small_dataset = vsag::Dataset::Make();
     const int64_t small_dim = 10;
@@ -292,7 +295,8 @@ TEST_CASE("SampleTrainingData Function Test", "[ut][SampleTrainingData]") {
         ->Owner(false);
 
     // Test that small dataset is returned as is
-    auto result = vsag::SampleTrainingData(small_dataset, small_count, small_dim, 10000, nullptr);
+    auto result =
+        vsag::sample_train_data(small_dataset, small_count, small_dim, 10000, allocator.get());
     REQUIRE(result == small_dataset);
 
     // Test with large dataset that should be sampled
@@ -315,7 +319,8 @@ TEST_CASE("SampleTrainingData Function Test", "[ut][SampleTrainingData]") {
         ->Owner(false);
 
     // Test that large dataset is sampled
-    result = vsag::SampleTrainingData(large_dataset, large_count, large_dim, sample_count, nullptr);
+    result = vsag::sample_train_data(
+        large_dataset, large_count, large_dim, sample_count, allocator.get());
     REQUIRE(result != large_dataset);
     REQUIRE(result->GetNumElements() == sample_count);
     REQUIRE(result->GetDim() == large_dim);
