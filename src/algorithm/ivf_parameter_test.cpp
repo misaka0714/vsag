@@ -16,8 +16,10 @@
 #include "ivf_parameter.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <numeric>
 
 #include "parameter_test.h"
+#include "utils/util_functions.h"
 
 struct IVFDefaultParam {
     std::string buckect_io_type = "block_memory_io";
@@ -237,7 +239,7 @@ TEST_CASE("IVF Parameters Train Sample Count Invalid Value Test",
 
     // Test invalid value exceeding maximum 65536
     json_obj = vsag::JsonType::Parse(param_str);
-    json_obj["ivf_train_sample_count"].SetInt(1000000);  // Exceeds maximum value
+    json_obj["ivf_train_sample_count"].SetInt(1000000);
     modified_param_str = json_obj.Dump();
 
     param_json = vsag::JsonType::Parse(modified_param_str);
@@ -268,4 +270,53 @@ TEST_CASE("IVF Sampling Logic Test", "[ut][IVFParameter][sampling]") {
         // Verify that this value is different from the default
         REQUIRE(param->train_sample_count != 65536L);
     }
+}
+
+TEST_CASE("SampleTrainingData Function Test", "[ut][SampleTrainingData]") {
+    // Test with small dataset that should not be sampled
+    auto small_dataset = vsag::Dataset::Make();
+    const int64_t small_dim = 10;
+    const int64_t small_count = 500;  // Less than MIN_TRAIN_SIZE (1000)
+
+    // Create test data
+    std::vector<float> small_data(small_dim * small_count);
+    std::iota(small_data.begin(), small_data.end(), 0.0f);
+
+    std::vector<int64_t> small_ids(small_count);
+    std::iota(small_ids.begin(), small_ids.end(), 0);
+
+    small_dataset->Dim(small_dim)
+        ->NumElements(small_count)
+        ->Ids(small_ids.data())
+        ->Float32Vectors(small_data.data())
+        ->Owner(false);
+
+    // Test that small dataset is returned as is
+    auto result = vsag::SampleTrainingData(small_dataset, small_count, small_dim, 10000, nullptr);
+    REQUIRE(result == small_dataset);
+
+    // Test with large dataset that should be sampled
+    auto large_dataset = vsag::Dataset::Make();
+    const int64_t large_dim = 10;
+    const int64_t large_count = 10000;
+    const int64_t sample_count = 5000;
+
+    // Create test data
+    std::vector<float> large_data(large_dim * large_count);
+    std::iota(large_data.begin(), large_data.end(), 0.0f);
+
+    std::vector<int64_t> large_ids(large_count);
+    std::iota(large_ids.begin(), large_ids.end(), 0);
+
+    large_dataset->Dim(large_dim)
+        ->NumElements(large_count)
+        ->Ids(large_ids.data())
+        ->Float32Vectors(large_data.data())
+        ->Owner(false);
+
+    // Test that large dataset is sampled
+    result = vsag::SampleTrainingData(large_dataset, large_count, large_dim, sample_count, nullptr);
+    REQUIRE(result != large_dataset);
+    REQUIRE(result->GetNumElements() == sample_count);
+    REQUIRE(result->GetDim() == large_dim);
 }
