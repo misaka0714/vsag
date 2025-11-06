@@ -357,7 +357,7 @@ IVF::Train(const DatasetPtr& data) {
     int64_t total_elements = data->GetNumElements();
     int64_t dim = data->GetDim();
     DatasetPtr train_data =
-        vsag::SampleTrainingData(data, total_elements, dim, train_sample_count_, allocator_);
+        vsag::sample_train_data(data, total_elements, dim, train_sample_count_, allocator_);
     int64_t sample_count = train_data->GetNumElements();
 
     partition_strategy_->Train(train_data);
