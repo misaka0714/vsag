@@ -145,9 +145,6 @@ private:
     DatasetPtr
     reorder(int64_t topk, DistHeapPtr& input, const float* query) const;
 
-    DatasetPtr
-    SampleTrainingData(const DatasetPtr& data, int64_t total_elements, int64_t dim_);
-
     void
     merge_one_unit(const MergeUnit& unit);
 
