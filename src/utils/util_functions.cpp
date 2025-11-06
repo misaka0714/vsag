@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 #include <random>
 
+#include "datacell/bucket_datacell.h"
+#include "dataset_impl.h"
 #include "vsag_exception.h"
 
 namespace vsag {
@@ -247,6 +249,76 @@ set_dataset(DataTypes type,
     } else {
         throw std::invalid_argument(fmt::format("no support for this type: {}", (int)type));
     }
+}
+
+DatasetPtr
+SampleTrainingData(const vsag::DatasetPtr& data,
+                   int64_t total_elements,
+                   int64_t dim,
+                   int64_t train_sample_count,
+                   Allocator* allocator) {
+    const int64_t MIN_TRAIN_SIZE = 512;
+    const int64_t MAX_TRAIN_SIZE = 65536;
+
+    int64_t sample_count;
+    if (train_sample_count >= MIN_TRAIN_SIZE) {
+        sample_count = std::min(train_sample_count, total_elements);
+    } else {
+        sample_count = MIN_TRAIN_SIZE;
+    }
+
+    sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
+
+    // If no sampling is needed, return the original dataset
+    if (sample_count >= total_elements) {
+        return data;
+    }
+
+    vsag::Vector<float> sampled_data_buffer(allocator);
+    vsag::Vector<int64_t> sampled_ids(allocator);
+
+    vsag::Vector<int64_t> sampled_indices(allocator);
+    sampled_indices.reserve(sample_count);
+    int64_t actual_size = std::min(sample_count, total_elements);
+    sampled_indices.resize(actual_size);
+    std::iota(sampled_indices.begin(), sampled_indices.end(), 0);
+
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+
+    for (int64_t i = sample_count; i < total_elements; ++i) {
+        std::uniform_int_distribution<int64_t> dist(0, i);
+        int64_t j = dist(gen);
+        if (j < sample_count) {
+            sampled_indices[j] = i;
+        }
+    }
+
+    sampled_data_buffer.resize(sample_count * dim);
+    const auto* original_data = data->GetFloat32Vectors();
+
+    for (int64_t i = 0; i < sample_count; ++i) {
+        std::copy(original_data + sampled_indices[i] * dim,
+                  original_data + (sampled_indices[i] + 1) * dim,
+                  sampled_data_buffer.data() + i * dim);
+    }
+
+    auto sampled_dataset = std::make_shared<DatasetImpl>();
+    sampled_dataset->NumElements(sample_count)
+        ->Dim(dim)
+        ->Float32Vectors(sampled_data_buffer.data())
+        ->Owner(false);
+
+    if (data->GetIds() != nullptr) {
+        sampled_ids.reserve(sample_count);
+        const auto* original_ids = data->GetIds();
+        for (int64_t i = 0; i < sample_count; ++i) {
+            sampled_ids.push_back(original_ids[sampled_indices[i]]);
+        }
+        sampled_dataset->Ids(sampled_ids.data())->Owner(false);
+    }
+
+    return sampled_dataset;
 }
 
 }  // namespace vsag
