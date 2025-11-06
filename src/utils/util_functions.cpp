@@ -16,13 +16,14 @@
 #include "util_functions.h"
 
 #include <iomanip>
+#include <iostream>
 #include <nlohmann/json.hpp>
 #include <random>
 
 #include "datacell/bucket_datacell.h"
 #include "dataset_impl.h"
+#include "impl/allocator/safe_allocator.h"
 #include "vsag_exception.h"
-
 namespace vsag {
 
 std::string
@@ -252,40 +253,45 @@ set_dataset(DataTypes type,
 }
 
 DatasetPtr
-SampleTrainingData(const vsag::DatasetPtr& data,
-                   int64_t total_elements,
-                   int64_t dim,
-                   int64_t train_sample_count,
-                   Allocator* allocator) {
+sample_train_data(const vsag::DatasetPtr& data,
+                  int64_t total_elements,
+                  int64_t dim,
+                  int64_t train_sample_count,
+                  Allocator* allocator) {
     const int64_t MIN_TRAIN_SIZE = 512;
     const int64_t MAX_TRAIN_SIZE = 65536;
 
     int64_t sample_count;
-    if (train_sample_count >= MIN_TRAIN_SIZE) {
-        sample_count = std::min(train_sample_count, total_elements);
+    if (total_elements < MIN_TRAIN_SIZE) {
+        sample_count = total_elements;
     } else {
-        sample_count = MIN_TRAIN_SIZE;
+        if (train_sample_count >= MIN_TRAIN_SIZE) {
+            sample_count = std::min(train_sample_count, total_elements);
+        } else {
+            sample_count = MIN_TRAIN_SIZE;
+        }
+        sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
     }
-
-    sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
 
     // If no sampling is needed, return the original dataset
     if (sample_count >= total_elements) {
         return data;
     }
 
-    auto sampled_data_buffer = std::make_unique<float[]>(sample_count * dim);
-    auto sampled_ids_buffer = std::make_unique<int64_t[]>(sample_count);
+    // If the allocator is null, use the default allocator
+    auto safe_allocator =
+        allocator ? allocator : vsag::SafeAllocator::FactoryDefaultAllocator().get();
 
-    vsag::Vector<int64_t> sampled_indices(allocator);
+    vsag::Vector<float> sampled_data_buffer(safe_allocator);
+    vsag::Vector<int64_t> sampled_ids(safe_allocator);
+    vsag::Vector<int64_t> sampled_indices(safe_allocator);
     sampled_indices.reserve(sample_count);
+
     int64_t actual_size = std::min(sample_count, total_elements);
     sampled_indices.resize(actual_size);
     std::iota(sampled_indices.begin(), sampled_indices.end(), 0);
-
     std::random_device rd;
     std::mt19937_64 gen(rd());
-
     for (int64_t i = sample_count; i < total_elements; ++i) {
         std::uniform_int_distribution<int64_t> dist(0, i);
         int64_t j = dist(gen);
@@ -293,30 +299,35 @@ SampleTrainingData(const vsag::DatasetPtr& data,
             sampled_indices[j] = i;
         }
     }
-
+    sampled_data_buffer.resize(sample_count * dim);
     const auto* original_data = data->GetFloat32Vectors();
-
     for (int64_t i = 0; i < sample_count; ++i) {
         std::copy(original_data + sampled_indices[i] * dim,
                   original_data + (sampled_indices[i] + 1) * dim,
-                  sampled_data_buffer.get() + i * dim);
+                  sampled_data_buffer.data() + i * dim);
     }
+    auto* new_data_buffer =
+        static_cast<float*>(safe_allocator->Allocate(sample_count * dim * sizeof(float)));
+    std::copy(sampled_data_buffer.begin(), sampled_data_buffer.end(), new_data_buffer);
 
     auto sampled_dataset = std::make_shared<DatasetImpl>();
-    // 设置数据集拥有这些缓冲区
     sampled_dataset->NumElements(sample_count)
         ->Dim(dim)
-        ->Float32Vectors(sampled_data_buffer.release())
-        ->Owner(true, allocator);
-
+        ->Float32Vectors(new_data_buffer)
+        ->Owner(true, safe_allocator);
     if (data->GetIds() != nullptr) {
+        sampled_ids.reserve(sample_count);
         const auto* original_ids = data->GetIds();
         for (int64_t i = 0; i < sample_count; ++i) {
-            sampled_ids_buffer[i] = original_ids[sampled_indices[i]];
+            sampled_ids.push_back(original_ids[sampled_indices[i]]);
         }
-        sampled_dataset->Ids(sampled_ids_buffer.release())->Owner(true, allocator);
-    }
 
+        auto* new_ids_buffer =
+            static_cast<int64_t*>(safe_allocator->Allocate(sample_count * sizeof(int64_t)));
+        std::copy(sampled_ids.begin(), sampled_ids.end(), new_ids_buffer);
+
+        sampled_dataset->Ids(new_ids_buffer)->Owner(true, safe_allocator);
+    }
     return sampled_dataset;
 }
 
