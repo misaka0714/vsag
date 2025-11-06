@@ -274,8 +274,8 @@ SampleTrainingData(const vsag::DatasetPtr& data,
         return data;
     }
 
-    vsag::Vector<float> sampled_data_buffer(allocator);
-    vsag::Vector<int64_t> sampled_ids(allocator);
+    auto sampled_data_buffer = std::make_unique<float[]>(sample_count * dim);
+    auto sampled_ids_buffer = std::make_unique<int64_t[]>(sample_count);
 
     vsag::Vector<int64_t> sampled_indices(allocator);
     sampled_indices.reserve(sample_count);
@@ -294,28 +294,27 @@ SampleTrainingData(const vsag::DatasetPtr& data,
         }
     }
 
-    sampled_data_buffer.resize(sample_count * dim);
     const auto* original_data = data->GetFloat32Vectors();
 
     for (int64_t i = 0; i < sample_count; ++i) {
         std::copy(original_data + sampled_indices[i] * dim,
                   original_data + (sampled_indices[i] + 1) * dim,
-                  sampled_data_buffer.data() + i * dim);
+                  sampled_data_buffer.get() + i * dim);
     }
 
     auto sampled_dataset = std::make_shared<DatasetImpl>();
+    // 设置数据集拥有这些缓冲区
     sampled_dataset->NumElements(sample_count)
         ->Dim(dim)
-        ->Float32Vectors(sampled_data_buffer.data())
-        ->Owner(false);
+        ->Float32Vectors(sampled_data_buffer.release())
+        ->Owner(true, allocator);
 
     if (data->GetIds() != nullptr) {
-        sampled_ids.reserve(sample_count);
         const auto* original_ids = data->GetIds();
         for (int64_t i = 0; i < sample_count; ++i) {
-            sampled_ids.push_back(original_ids[sampled_indices[i]]);
+            sampled_ids_buffer[i] = original_ids[sampled_indices[i]];
         }
-        sampled_dataset->Ids(sampled_ids.data())->Owner(false);
+        sampled_dataset->Ids(sampled_ids_buffer.release())->Owner(true, allocator);
     }
 
     return sampled_dataset;
