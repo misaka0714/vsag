@@ -131,10 +131,10 @@ set_dataset(DataTypes type,
             uint32_t num_element);
 
 DatasetPtr
-SampleTrainingData(const DatasetPtr& data,
-                   int64_t total_elements,
-                   int64_t dim,
-                   int64_t train_sample_count,
-                   Allocator* allocator = nullptr);
+sample_train_data(const DatasetPtr& data,
+                  int64_t total_elements,
+                  int64_t dim,
+                  int64_t train_sample_count,
+                  Allocator* allocator = nullptr);
 
 }  // namespace vsag
