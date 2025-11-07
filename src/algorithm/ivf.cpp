@@ -34,8 +34,6 @@
 #include "utils/util_functions.h"
 
 namespace vsag {
-static constexpr const int64_t MAX_TRAIN_SIZE = 65536L;
-static constexpr const int64_t MIN_TRAIN_SIZE = 512L;
 static constexpr const char* IVF_PARAMS_TEMPLATE =
     R"(
     {
