@@ -144,34 +144,6 @@ TEST_CASE("IVF Parameters Test", "[ut][IVFParameter]") {
     REQUIRE(search_param.first_order_scan_ratio == 0.1f);
 }
 
-TEST_CASE("IVF Parameters Train Sample Count Test", "[ut][IVFParameter][train_sample_count]") {
-    IVFDefaultParam index_param;
-    auto param_str = generate_ivf_param(index_param);
-
-    auto json_obj = vsag::JsonType::Parse(param_str);
-    json_obj["ivf_train_sample_count"].SetInt(32767);
-    auto modified_param_str = json_obj.Dump();
-
-    vsag::JsonType param_json = vsag::JsonType::Parse(modified_param_str);
-    auto param = std::make_shared<vsag::IVFParameter>();
-    param->FromJson(param_json);
-    REQUIRE(param->train_sample_count == 32767);
-
-    json_obj["ivf_train_sample_count"].SetInt(512);
-    modified_param_str = json_obj.Dump();
-
-    param_json = vsag::JsonType::Parse(modified_param_str);
-    param = std::make_shared<vsag::IVFParameter>();
-    param->FromJson(param_json);
-    REQUIRE(param->train_sample_count == 512);
-
-    param_str = generate_ivf_param(index_param);
-    param_json = vsag::JsonType::Parse(param_str);
-    param = std::make_shared<vsag::IVFParameter>();
-    param->FromJson(param_json);
-    REQUIRE(param->train_sample_count == 65536L);
-}
-
 #define TEST_COMPATIBILITY_CASE(section_name, param_member, val1, val2, expect_compatible) \
     SECTION(section_name) {                                                                \
         IVFDefaultParam param1;                                                            \
@@ -222,18 +194,41 @@ TEST_CASE("IVF Parameters CheckCompatibility", "[ut][IVFParameter][CheckCompatib
     TEST_COMPATIBILITY_CASE("ivf use_attribute_filter", use_attribute_filter, true, false, false);
 }
 
-TEST_CASE("IVF Parameters Train Sample Count Invalid Value Test",
-          "[ut][IVFParameter][train_sample_count]") {
+TEST_CASE("IVF Parameters Train Sample Count Test", "[ut][IVFParameter][train_sample_count]") {
     IVFDefaultParam index_param;
     auto param_str = generate_ivf_param(index_param);
 
-    // Test invalid value less than minimum 512
+    // Test valid values
     auto json_obj = vsag::JsonType::Parse(param_str);
-    json_obj["ivf_train_sample_count"].SetInt(100);  // Invalid value, less than minimum 512
+    json_obj["ivf_train_sample_count"].SetInt(32767);
     auto modified_param_str = json_obj.Dump();
 
     vsag::JsonType param_json = vsag::JsonType::Parse(modified_param_str);
     auto param = std::make_shared<vsag::IVFParameter>();
+    param->FromJson(param_json);
+    REQUIRE(param->train_sample_count == 32767);
+
+    json_obj["ivf_train_sample_count"].SetInt(512);
+    modified_param_str = json_obj.Dump();
+
+    param_json = vsag::JsonType::Parse(modified_param_str);
+    param = std::make_shared<vsag::IVFParameter>();
+    param->FromJson(param_json);
+    REQUIRE(param->train_sample_count == 512);
+
+    param_str = generate_ivf_param(index_param);
+    param_json = vsag::JsonType::Parse(param_str);
+    param = std::make_shared<vsag::IVFParameter>();
+    param->FromJson(param_json);
+    REQUIRE(param->train_sample_count == 65536L);
+
+    // Test invalid value less than minimum 512
+    json_obj = vsag::JsonType::Parse(param_str);
+    json_obj["ivf_train_sample_count"].SetInt(100);  // Invalid value, less than minimum 512
+    modified_param_str = json_obj.Dump();
+
+    param_json = vsag::JsonType::Parse(modified_param_str);
+    param = std::make_shared<vsag::IVFParameter>();
 
     REQUIRE_THROWS_AS(param->FromJson(param_json), vsag::VsagException);
 
@@ -272,7 +267,7 @@ TEST_CASE("IVF Sampling Logic Test", "[ut][IVFParameter][sampling]") {
     }
 }
 
-TEST_CASE("SampleTrainingData Function Test", "[ut][SampleTrainingData]") {
+TEST_CASE("SampleTrainingData Function Test", "[ut][sample_train_data]") {
     // Create allocator
     auto allocator = vsag::SafeAllocator::FactoryDefaultAllocator();
 
