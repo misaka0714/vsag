@@ -258,19 +258,19 @@ sample_train_data(const vsag::DatasetPtr& data,
                   int64_t dim,
                   int64_t train_sample_count,
                   Allocator* allocator) {
-    const int64_t MIN_TRAIN_SIZE = 512;
-    const int64_t MAX_TRAIN_SIZE = 65536;
+    const int64_t min_train_size = 512;
+    const int64_t max_train_size = 65536;
 
     int64_t sample_count;
-    if (total_elements < MIN_TRAIN_SIZE) {
+    if (total_elements < min_train_size) {
         sample_count = total_elements;
     } else {
-        if (train_sample_count >= MIN_TRAIN_SIZE) {
+        if (train_sample_count >= min_train_size) {
             sample_count = std::min(train_sample_count, total_elements);
         } else {
-            sample_count = MIN_TRAIN_SIZE;
+            sample_count = min_train_size;
         }
-        sample_count = std::min(sample_count, MAX_TRAIN_SIZE);
+        sample_count = std::min(sample_count, max_train_size);
     }
 
     // If no sampling is needed, return the original dataset
@@ -279,8 +279,8 @@ sample_train_data(const vsag::DatasetPtr& data,
     }
 
     // If the allocator is null, use the default allocator
-    auto safe_allocator =
-        allocator ? allocator : vsag::SafeAllocator::FactoryDefaultAllocator().get();
+    auto* safe_allocator =
+        allocator != nullptr ? allocator : vsag::SafeAllocator::FactoryDefaultAllocator().get();
 
     vsag::Vector<float> sampled_data_buffer(safe_allocator);
     vsag::Vector<int64_t> sampled_ids(safe_allocator);
