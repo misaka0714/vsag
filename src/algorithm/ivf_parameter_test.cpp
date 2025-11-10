@@ -274,7 +274,7 @@ TEST_CASE("SampleTrainingData Function Test", "[ut][sample_train_data]") {
     // Test with small dataset that should not be sampled
     auto small_dataset = vsag::Dataset::Make();
     const int64_t small_dim = 10;
-    const int64_t small_count = 500;  // Less than MIN_TRAIN_SIZE (1000)
+    const int64_t small_count = 500;
 
     // Create test data
     std::vector<float> small_data(small_dim * small_count);
@@ -320,8 +320,8 @@ TEST_CASE("SampleTrainingData Function Test", "[ut][sample_train_data]") {
     REQUIRE(result->GetNumElements() == sample_count);
     REQUIRE(result->GetDim() == large_dim);
 
-    // Test with train_sample_count less than MIN_TRAIN_SIZE
-    // In this case, the function should use MIN_TRAIN_SIZE (512) as the sample count
+    // Test with train_sample_count less than min_train_size
+    // In this case, the function should use min_train_size (512) as the sample count
     const int64_t normal_count = 20000;
     auto normal_dataset = vsag::Dataset::Make();
     std::vector<float> normal_data(large_dim * normal_count);
@@ -336,12 +336,12 @@ TEST_CASE("SampleTrainingData Function Test", "[ut][sample_train_data]") {
         ->Float32Vectors(normal_data.data())
         ->Owner(false);
 
-    // When train_sample_count is less than MIN_TRAIN_SIZE (512),
+    // When train_sample_count is less than min_train_size (512),
     // the function should use MIN_TRAIN_SIZE as the sample count
-    const int64_t small_sample_count = 100;  // Less than MIN_TRAIN_SIZE (512)
+    const int64_t small_sample_count = 100;  // Less than min_train_size (512)
     result = vsag::sample_train_data(
         normal_dataset, normal_count, large_dim, small_sample_count, allocator.get());
     REQUIRE(result != normal_dataset);
-    REQUIRE(result->GetNumElements() == 512);  // Should use MIN_TRAIN_SIZE
+    REQUIRE(result->GetNumElements() == 512);  // Should use min_train_size
     REQUIRE(result->GetDim() == large_dim);
 }
