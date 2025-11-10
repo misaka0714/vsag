@@ -16,7 +16,6 @@
 #include "util_functions.h"
 
 #include <iomanip>
-#include <iostream>
 #include <nlohmann/json.hpp>
 #include <random>
 
@@ -164,12 +163,9 @@ std::string
 get_current_time() {
     auto now = std::chrono::system_clock::now();
     auto now_c = std::chrono::system_clock::to_time_t(now);
-    std::tm now_tm{};
-    if (localtime_r(&now_c, &now_tm) == nullptr) {
-        return "invalid time";
-    }
+    std::tm* now_tm = std::localtime(&now_c);
     std::ostringstream oss;
-    oss << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S");
+    oss << std::put_time(now_tm, "%Y-%m-%d %H:%M:%S");
     return oss.str();
 }
 
@@ -264,17 +260,8 @@ sample_train_data(const vsag::DatasetPtr& data,
     const int64_t min_train_size = 512;
     const int64_t max_train_size = 65536;
 
-    int64_t sample_count;
-    if (total_elements < min_train_size) {
-        sample_count = total_elements;
-    } else {
-        if (train_sample_count >= min_train_size) {
-            sample_count = std::min(train_sample_count, total_elements);
-        } else {
-            sample_count = min_train_size;
-        }
-        sample_count = std::min(sample_count, max_train_size);
-    }
+    int64_t sample_count =
+        std::min({max_train_size, total_elements, std::max(min_train_size, train_sample_count)});
 
     // If no sampling is needed, return the original dataset
     if (sample_count >= total_elements) {
@@ -282,8 +269,14 @@ sample_train_data(const vsag::DatasetPtr& data,
     }
 
     // If the allocator is null, use the default allocator
-    auto* safe_allocator =
-        allocator != nullptr ? allocator : vsag::SafeAllocator::FactoryDefaultAllocator().get();
+    std::shared_ptr<Allocator> owned_allocator;
+    Allocator* safe_allocator;
+    if (allocator != nullptr) {
+        safe_allocator = allocator;
+    } else {
+        owned_allocator = vsag::SafeAllocator::FactoryDefaultAllocator();
+        safe_allocator = owned_allocator.get();
+    }
 
     vsag::Vector<float> sampled_data_buffer(safe_allocator);
     vsag::Vector<int64_t> sampled_ids(safe_allocator);
