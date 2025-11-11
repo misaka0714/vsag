@@ -362,7 +362,6 @@ IVF::Train(const DatasetPtr& data) {
     partition_strategy_->Train(train_data);
 
     const auto* data_ptr = train_data->GetFloat32Vectors();
-    Vector<float> train_data_buffer(allocator_);
     this->bucket_->Train(data_ptr, sample_count);
     if (use_reorder_) {
         this->reorder_codes_->Train(data->GetFloat32Vectors(), data->GetNumElements());
