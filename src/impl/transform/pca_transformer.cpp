@@ -15,20 +15,25 @@
 
 #include "pca_transformer.h"
 
+#include <cblas.h>
 #include <fmt/format.h>
+#include <lapacke.h>
 
 #include <random>
 
-#include "impl/blas/blas_function.h"
 #include "vsag_exception.h"
 
 namespace vsag {
 PCATransformer::PCATransformer(Allocator* allocator, int64_t input_dim, int64_t output_dim)
     : VectorTransformer(allocator, input_dim, output_dim),
       pca_matrix_(allocator),
-      mean_(allocator) {
+      mean_(allocator),
+      variances_(allocator),
+      eigen_values_(allocator) {
     pca_matrix_.resize(output_dim * input_dim);
     mean_.resize(input_dim);
+    variances_.resize(output_dim);
+    eigen_values_.resize(input_dim);
     this->type_ = VectorTransformerType::PCA;
 }
 
@@ -69,18 +74,18 @@ PCATransformer::Transform(const float* input_vec, float* output_vec) const {
     //       [1, 0, 0,] * [1,]  = [1,]
     //       [0, 0, 1 ]   [2,]  = [3 ]
     //                    [3 ]
-    BlasFunction::Sgemv(BlasFunction::RowMajor,
-                        BlasFunction::NoTrans,
-                        static_cast<int32_t>(output_dim_),
-                        static_cast<int32_t>(input_dim_),
-                        1.0F,
-                        pca_matrix_.data(),
-                        static_cast<int32_t>(input_dim_),
-                        centralized_vec.data(),
-                        1,
-                        0.0F,
-                        output_vec,
-                        1);
+    cblas_sgemv(CblasRowMajor,
+                CblasNoTrans,
+                static_cast<blasint>(output_dim_),
+                static_cast<blasint>(input_dim_),
+                1.0F,
+                pca_matrix_.data(),
+                static_cast<blasint>(input_dim_),
+                centralized_vec.data(),
+                1,
+                0.0F,
+                output_vec,
+                1);
 
     return meta;
 }
@@ -154,20 +159,30 @@ PCATransformer::PerformEigenDecomposition(const float* covariance_matrix) {
         covariance_matrix, covariance_matrix + input_dim_ * input_dim_, eigen_vectors.begin());
 
     // 1. decomposition
-    int32_t ssyev_result = BlasFunction::Ssyev(BlasFunction::RowMajor,
-                                               BlasFunction::JobV,
-                                               BlasFunction::Upper,
-                                               static_cast<int32_t>(input_dim_),
-                                               eigen_vectors.data(),
-                                               static_cast<int32_t>(input_dim_),
-                                               eigen_values.data());
+    int ssyev_result = LAPACKE_ssyev(LAPACK_ROW_MAJOR,
+                                     'V',
+                                     'U',
+                                     static_cast<blasint>(input_dim_),
+                                     eigen_vectors.data(),
+                                     static_cast<blasint>(input_dim_),
+                                     eigen_values.data());
 
     if (ssyev_result != 0) {
         logger::error(fmt::format("Error in sgeqrf: {}", ssyev_result));
         return false;
     }
 
-    // 2. pca_matrix_[i][input_dim_] = eigen_vectors[- 1 - i][input_dim_]
+    // 2. Save eigen values
+    for (uint64_t i = 0; i < input_dim_; ++i) {
+        eigen_values_[i] = eigen_values[i];
+    }
+    
+    // 3. Calculate variances for each PCA dimension (use top output_dim_ eigenvalues)
+    for (uint64_t i = 0; i < output_dim_; ++i) {
+        variances_[i] = eigen_values[input_dim_ - 1 - i];
+    }
+
+    // 4. pca_matrix_[i][input_dim_] = eigen_vectors[- 1 - i][input_dim_]
     for (uint64_t i = 0; i < output_dim_; ++i) {
         for (uint64_t j = 0; j < input_dim_; ++j) {
             pca_matrix_[i * input_dim_ + j] = eigen_vectors[(input_dim_ - 1 - i) * input_dim_ + j];
@@ -201,6 +216,34 @@ void
 PCATransformer::SetPCAMatrixForTest(const float* input_pca_matrix) {
     for (uint64_t i = 0; i < pca_matrix_.size(); i++) {
         pca_matrix_[i] = input_pca_matrix[i];
+    }
+}
+
+void
+PCATransformer::ComputeCumulativeErrorUpperBound(const float* query_vec, float* pre_query, float sigma_count) const {
+    // Step 1: Transform query to PCA space
+    vsag::Vector<float> pca_query(allocator_);
+    pca_query.resize(output_dim_, 0.0F);
+    this->Transform(query_vec, pca_query.data());
+    
+    // Step 2: Calculate q[i]^2 * var[i] for each dimension
+    vsag::Vector<float> q_sq_var(allocator_);
+    q_sq_var.resize(output_dim_, 0.0F);
+    for (uint64_t i = 0; i < output_dim_; ++i) {
+        float q_i = pca_query[i];
+        q_sq_var[i] = q_i * q_i * variances_[i];
+    }
+    
+    // Step 3: Build inverse cumulative sum array
+    pre_query[output_dim_] = 0.0F;
+    for (int64_t i = output_dim_ - 1; i >= 0; --i) {
+        pre_query[i] = q_sq_var[i] + pre_query[i + 1];
+    }
+    
+    // Step 4: Apply safety factor and convert to distance scale
+    float safety_factor = sigma_count * sigma_count;
+    for (uint64_t i = 0; i <= output_dim_; ++i) {
+        pre_query[i] = sqrt(pre_query[i] * safety_factor) * 2.0F;
     }
 }
 
