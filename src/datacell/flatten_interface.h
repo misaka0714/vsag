@@ -104,6 +104,10 @@ public:
         throw VsagException(ErrorType::INTERNAL_ERROR,
                             "InitIO not implemented in FlattenInterface");
     }
+    virtual int64_t
+    GetCurrentMemoryUsage() const {
+        return 0;
+    }
 
     virtual IndexCommonParam
     ExportCommonParam() {
@@ -131,6 +135,9 @@ public:
 
     virtual bool
     Decode(const uint8_t* codes, DataType* vector) = 0;
+
+    virtual bool
+    Encode(const DataType* vector, uint8_t* codes) = 0;
 
     [[nodiscard]] virtual const uint8_t*
     GetCodesById(InnerIdType id, bool& need_release) const = 0;

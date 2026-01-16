@@ -54,6 +54,9 @@ public:
     std::vector<int64_t>
     Build(const DatasetPtr& base) override;
 
+    bool
+    UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update = false) override;
+
     DatasetPtr
     KnnSearch(const DatasetPtr& query,
               int64_t k,
@@ -109,14 +112,16 @@ public:
     DatasetPtr
     CalDistanceById(const DatasetPtr& query, const int64_t* ids, int64_t count) const override;
 
-    bool
-    UpdateId(int64_t old_id, int64_t new_id) override;
-
     std::pair<int64_t, int64_t>
     GetMinAndMaxId() const override;
 
     void
     SetImmutable() override;
+
+    int64_t
+    GetMemoryUsage() const override {
+        return this->CalSerializeSize();
+    }
 
 private:
     template <InnerSearchMode mode>
@@ -142,11 +147,17 @@ private:
 
     bool use_reorder_{false};
 
+    bool use_quantization_{false};
+
     float doc_retain_ratio_{0};
 
     std::shared_ptr<SparseIndex> rerank_flat_index_{nullptr};
+
     bool deserialize_without_footer_{false};
     bool deserialize_without_buffer_{false};
+
+    std::shared_ptr<QuantizationParams> quantization_params_;
+    uint32_t avg_doc_term_length_{100};
 };
 
 }  // namespace vsag

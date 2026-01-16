@@ -33,12 +33,15 @@ SINDI::CheckAndMappingExternalParam(const JsonType& external_param,
 SINDI::SINDI(const SINDIParameterPtr& param, const IndexCommonParam& common_param)
     : InnerIndexInterface(param, common_param),
       use_reorder_(param->use_reorder),
+      use_quantization_(param->use_quantization),
       term_id_limit_(param->term_id_limit),
       window_size_(param->window_size),
       doc_retain_ratio_(1.0F - param->doc_prune_ratio),
       window_term_list_(common_param.allocator_.get()),
       deserialize_without_footer_(param->deserialize_without_footer),
-      deserialize_without_buffer_(param->deserialize_without_buffer) {
+      deserialize_without_buffer_(param->deserialize_without_buffer),
+      quantization_params_(std::make_shared<QuantizationParams>()),
+      avg_doc_term_length_(param->avg_doc_term_length) {
     if (use_reorder_) {
         SparseIndexParameterPtr rerank_param = std::make_shared<SparseIndexParameters>();
         rerank_param->need_sort = true;
@@ -59,11 +62,37 @@ SINDI::Add(const DatasetPtr& base) {
     const auto* extra_info = base->GetExtraInfos();
     const auto extra_info_size = base->GetExtraInfoSize();
 
+    if (use_quantization_ && cur_element_count_ == 0) {
+        float min_val = std::numeric_limits<float>::max();
+        float max_val = std::numeric_limits<float>::lowest();
+        for (int64_t i = 0; i < data_num; ++i) {
+            const auto& vec = sparse_vectors[i];
+            for (int j = 0; j < vec.len_; ++j) {
+                float val = vec.vals_[j];
+                if (val < min_val) {
+                    min_val = val;
+                }
+                if (val > max_val) {
+                    max_val = val;
+                }
+            }
+        }
+        quantization_params_->min_val = min_val;
+        quantization_params_->max_val = max_val;
+        quantization_params_->diff = max_val - min_val;
+        if (quantization_params_->diff < 1e-6) {
+            quantization_params_->diff = 1.0F;
+        }
+    }
+
     // adjust window
     int64_t final_add_window = align_up(cur_element_count_ + data_num, window_size_) / window_size_;
     while (window_term_list_.size() < final_add_window) {
-        window_term_list_.emplace_back(
-            std::make_shared<SparseTermDataCell>(doc_retain_ratio_, term_id_limit_, allocator_));
+        window_term_list_.emplace_back(std::make_shared<SparseTermDataCell>(doc_retain_ratio_,
+                                                                            term_id_limit_,
+                                                                            allocator_,
+                                                                            use_quantization_,
+                                                                            quantization_params_));
     }
 
     // add process
@@ -71,6 +100,11 @@ SINDI::Add(const DatasetPtr& base) {
         auto cur_window = cur_element_count_ / window_size_;
         auto window_start_id = cur_window * window_size_;
         const auto& sparse_vector = sparse_vectors[i];
+        if (label_table_->CheckLabel(ids[i])) {
+            failed_ids.push_back(ids[i]);
+            logger::warn("id ({}) already exists", ids[i]);
+            continue;
+        }
         if (sparse_vector.len_ <= 0) {
             failed_ids.push_back(ids[i]);
             logger::warn(
@@ -78,7 +112,7 @@ SINDI::Add(const DatasetPtr& base) {
             continue;
         }
 
-        uint32_t inner_id = cur_element_count_ - window_start_id;
+        auto inner_id = static_cast<uint16_t>(cur_element_count_ - window_start_id);
 
         try {
             window_term_list_[cur_window]->InsertVector(sparse_vector, inner_id);
@@ -118,6 +152,37 @@ std::vector<int64_t>
 SINDI::Build(const DatasetPtr& base) {
     // note that there's a wlock in Add()
     return this->Add(base);
+}
+
+bool
+SINDI::UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update) {
+    // Note:
+    // 1. we only check whether the old vector is a subset of the new vector
+    // 2. we do not actually update the vector
+    auto check_and_cleanup = [this, id, &new_base](InnerIndexInterface* index) -> bool {
+        SparseVector old_sv;
+        uint32_t inner_id;
+        {
+            std::scoped_lock rlock(this->global_mutex_);
+            inner_id = this->label_table_->GetIdByLabel(id);
+        }
+        index->GetSparseVectorByInnerId(inner_id, &old_sv, this->allocator_);
+
+        const auto& new_sv = *new_base->GetSparseVectors();
+        bool ret = is_subset_of_sparse_vector(old_sv, new_sv);
+
+        this->allocator_->Deallocate(old_sv.vals_);
+        this->allocator_->Deallocate(old_sv.ids_);
+        return ret;
+    };
+
+    if (use_reorder_) {
+        if (not check_and_cleanup(rerank_flat_index_.get())) {
+            return false;
+        }
+    }
+
+    return check_and_cleanup(this);
 }
 
 DatasetPtr
@@ -322,6 +387,12 @@ SINDI::Serialize(StreamWriter& writer) const {
 
     StreamWriter::WriteObj(writer, cur_element_count_);
 
+    if (use_quantization_) {
+        StreamWriter::WriteObj(writer, quantization_params_->min_val);
+        StreamWriter::WriteObj(writer, quantization_params_->max_val);
+        StreamWriter::WriteObj(writer, quantization_params_->diff);
+    }
+
     uint32_t window_term_list_size = window_term_list_.size();
     StreamWriter::WriteObj(writer, window_term_list_size);
     for (const auto& window : window_term_list_) {
@@ -375,12 +446,18 @@ SINDI::Deserialize(StreamReader& reader) {
 
     StreamReader::ReadObj(reader_ref, cur_element_count_);
 
+    if (use_quantization_) {
+        StreamReader::ReadObj(reader_ref, quantization_params_->min_val);
+        StreamReader::ReadObj(reader_ref, quantization_params_->max_val);
+        StreamReader::ReadObj(reader_ref, quantization_params_->diff);
+    }
+
     uint32_t window_term_list_size = 0;
     StreamReader::ReadObj(reader_ref, window_term_list_size);
     window_term_list_.resize(window_term_list_size);
     for (auto& window : window_term_list_) {
-        window =
-            std::make_shared<SparseTermDataCell>(doc_retain_ratio_, term_id_limit_, allocator_);
+        window = std::make_shared<SparseTermDataCell>(
+            doc_retain_ratio_, term_id_limit_, allocator_, use_quantization_, quantization_params_);
         window->Deserialize(reader_ref);
     }
 
@@ -389,17 +466,6 @@ SINDI::Deserialize(StreamReader& reader) {
     if (use_reorder_) {
         rerank_flat_index_->Deserialize(reader_ref);
     }
-}
-
-bool
-SINDI::UpdateId(int64_t old_id, int64_t new_id) {
-    if (old_id == new_id) {
-        return true;
-    }
-
-    std::scoped_lock wlock(this->global_mutex_);
-    label_table_->UpdateLabel(old_id, new_id);
-    return true;
 }
 
 std::pair<int64_t, int64_t>
@@ -428,7 +494,11 @@ SINDI::EstimateMemory(uint64_t num_elements) const {
     mem += 2 * sizeof(int64_t) * num_elements;
 
     // size of term id + term data
-    mem += ESTIMATE_DOC_TERM * num_elements * sizeof(float) * 2;
+    if (use_quantization_) {
+        mem += avg_doc_term_length_ * num_elements * (sizeof(uint8_t) + sizeof(uint16_t));
+    } else {
+        mem += avg_doc_term_length_ * num_elements * (sizeof(float) + sizeof(uint16_t));
+    }
 
     // size of rerank index is same as sindi
     if (use_reorder_) {
@@ -477,7 +547,8 @@ SINDI::CalcDistanceById(const DatasetPtr& vector, int64_t id) const {
     search_param.query_prune_ratio = 0;
     search_param.term_prune_ratio = 0;
     auto computer = std::make_shared<SparseTermComputer>(sparse_query, search_param, allocator_);
-    return term_list->CalcDistanceByInnerId(computer, inner_id - window_start_id);
+    return term_list->CalcDistanceByInnerId(computer,
+                                            static_cast<uint16_t>(inner_id - window_start_id));
 }
 
 DatasetPtr
@@ -490,7 +561,7 @@ SINDI::CalDistanceById(const DatasetPtr& query, const int64_t* ids, int64_t coun
     // prepare result
     auto result = Dataset::Make();
     result->Owner(true, allocator_);
-    auto* distances = (float*)allocator_->Allocate(sizeof(float) * count);
+    auto* distances = static_cast<float*>(allocator_->Allocate(sizeof(float) * count));
     std::fill_n(distances, count, -1.0F);
     result->Distances(distances);
 
@@ -564,8 +635,8 @@ SINDI::InitFeatures() {
     // concurrency
     this->index_feature_list_->SetFeatures({IndexFeature::SUPPORT_SEARCH_CONCURRENT,
                                             IndexFeature::SUPPORT_ADD_CONCURRENT,
-                                            IndexFeature::SUPPORT_ADD_CONCURRENT,
-                                            IndexFeature::SUPPORT_UPDATE_ID_CONCURRENT});
+                                            IndexFeature::SUPPORT_UPDATE_ID_CONCURRENT,
+                                            IndexFeature::SUPPORT_UPDATE_VECTOR_CONCURRENT});
 
     // metric
     this->index_feature_list_->SetFeature(IndexFeature::SUPPORT_METRIC_TYPE_INNER_PRODUCT);

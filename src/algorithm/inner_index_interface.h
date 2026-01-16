@@ -22,6 +22,7 @@
 #include "data_type.h"
 #include "datacell/attribute_inverted_interface.h"
 #include "datacell/extra_info_interface.h"
+#include "datacell/flatten_interface.h"
 #include "dataset_impl.h"
 #include "inner_index_parameter.h"
 #include "metric_type.h"
@@ -205,7 +206,8 @@ public:
 
     [[nodiscard]] virtual int64_t
     GetMemoryUsage() const {
-        return static_cast<int64_t>(this->CalSerializeSize());
+        std::shared_lock lock(this->memory_usage_mutex_);
+        return this->current_memory_usage_.load();
     }
 
     [[nodiscard]] virtual std::string
@@ -405,10 +407,7 @@ public:
     UpdateExtraInfo(const DatasetPtr& new_base);
 
     virtual bool
-    UpdateId(int64_t old_id, int64_t new_id) {
-        throw VsagException(ErrorType::UNSUPPORTED_INDEX_OPERATION,
-                            "Index doesn't support UpdateId");
-    }
+    UpdateId(int64_t old_id, int64_t new_id);
 
     virtual bool
     UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update = false) {
@@ -426,6 +425,15 @@ protected:
 
     virtual DetailDataPtr
     get_detail_data_by_info(const IndexDetailInfo& info) const;
+
+    float
+    calc_distance_by_id(const float* query, int64_t id, const FlattenInterfacePtr& data) const;
+
+    DatasetPtr
+    cal_distance_by_id(const float* query,
+                       const int64_t* ids,
+                       int64_t count,
+                       const FlattenInterfacePtr& data) const;
 
 public:
     LabelTablePtr label_table_{nullptr};
@@ -447,6 +455,9 @@ public:
     bool immutable_{false};
 
 protected:
+    std::atomic<int64_t> current_memory_usage_{0};
+    mutable std::shared_mutex memory_usage_mutex_{};
+
     bool has_raw_vector_{false};
     bool has_attribute_{false};
 
@@ -456,8 +467,9 @@ protected:
     ExtraInfoInterfacePtr extra_infos_{nullptr};
 
     uint64_t build_thread_count_{1};
+    int64_t train_sample_count_{65536L};
 
-    std::shared_ptr<SafeThreadPool> build_pool_{nullptr};
+    std::shared_ptr<SafeThreadPool> thread_pool_{nullptr};
 
     AttrInvertedInterfacePtr attr_filter_index_{nullptr};
 };

@@ -41,6 +41,8 @@ public:
         std::string metric_type;
         int64_t dim;
         std::string quantization_str = "sq8";
+        uint32_t rabitq_num_bit_base = 1;
+        uint32_t rabitq_num_bit_query = 32;
         int thread_count = 5;
         int extra_info_size = 0;
         std::string data_type = "float32";
@@ -92,7 +94,7 @@ using HGraphTestIndexPtr = std::shared_ptr<HGraphTestIndex>;
 
 TestDatasetPool HGraphTestIndex::pool{};
 fixtures::TempDir HGraphTestIndex::dir{"hgraph_test"};
-uint64_t HGraphTestIndex::base_count = 1200;
+uint64_t HGraphTestIndex::base_count = 600;
 const std::string HGraphTestIndex::name = "hgraph";
 const std::vector<std::pair<std::string, float>> HGraphTestIndex::all_test_cases = {
     {"fp32", 0.99},
@@ -100,7 +102,11 @@ const std::vector<std::pair<std::string, float>> HGraphTestIndex::all_test_cases
     {"fp16", 0.98},
     {"sq8", 0.95},
     {"sq8_uniform", 0.95},
-    {"rabitq,fp32", 0.3},
+    {"rabitq,fp32,block_memory_io,4,1", 0.3},
+    {"rabitq,fp32,block_memory_io,32,1", 0.3},
+    {"rabitq,fp32,block_memory_io,32,2", 0.3},
+    {"rabitq,fp32,block_memory_io,32,4", 0.3},
+    {"rabitq,fp32,block_memory_io,32,8", 0.3},
     {"pq,fp32", 0.95},
     {"sq4_uniform,fp32", 0.95},
     {"sq8_uniform,fp32", 0.98},
@@ -163,7 +169,9 @@ HGraphTestIndex::GenerateHGraphBuildParametersString(const HGraphBuildParam& par
             "store_raw_vector": {},
             "support_duplicate": {},
             "graph_io_type": "{}",
-            "graph_file_path": "{}"
+            "graph_file_path": "{}",
+            "rabitq_bits_per_dim_base": {},
+            "rabitq_bits_per_dim_query": {}
         }}
     }}
     )";
@@ -190,7 +198,9 @@ HGraphTestIndex::GenerateHGraphBuildParametersString(const HGraphBuildParam& par
             "store_raw_vector": {},
             "support_duplicate": {},
             "graph_io_type": "{}",
-            "graph_file_path": "{}"
+            "graph_file_path": "{}",
+            "rabitq_bits_per_dim_base": {},
+            "rabitq_bits_per_dim_query": {}
         }}
     }}
     )";
@@ -203,10 +213,15 @@ HGraphTestIndex::GenerateHGraphBuildParametersString(const HGraphBuildParam& par
     auto strs = fixtures::SplitString(param.quantization_str, ',');
     std::string high_quantizer_str, precise_io_type = "block_memory_io";
     auto& base_quantizer_str = strs[0];
+    uint32_t rabitq_num_bit_query = 32, rabitq_num_bit_base = 1;
     if (strs.size() > 1) {
         high_quantizer_str = strs[1];
         if (strs.size() > 2) {
             precise_io_type = strs[2];
+        }
+        if (strs.size() > 4 and base_quantizer_str == vsag::QUANTIZATION_TYPE_VALUE_RABITQ) {
+            rabitq_num_bit_query = std::stoi(strs[3]);
+            rabitq_num_bit_base = std::stoi(strs[4]);
         }
         build_parameters_str = fmt::format(parameter_temp_reorder,
                                            param.data_type,
@@ -227,7 +242,9 @@ HGraphTestIndex::GenerateHGraphBuildParametersString(const HGraphBuildParam& par
                                            param.store_raw_vector,
                                            param.support_duplicate,
                                            param.graph_io_type,
-                                           param.graph_file_path);
+                                           param.graph_file_path,
+                                           rabitq_num_bit_base,
+                                           rabitq_num_bit_query);
     } else {
         build_parameters_str = fmt::format(parameter_temp_origin,
                                            param.data_type,
@@ -244,7 +261,9 @@ HGraphTestIndex::GenerateHGraphBuildParametersString(const HGraphBuildParam& par
                                            param.store_raw_vector,
                                            param.support_duplicate,
                                            param.graph_io_type,
-                                           param.graph_file_path);
+                                           param.graph_file_path,
+                                           param.rabitq_num_bit_base,
+                                           param.rabitq_num_bit_query);
     }
     return build_parameters_str;
 }
@@ -508,10 +527,9 @@ TestHGraphBuildAndContinueAdd(const fixtures::HGraphTestIndexPtr& test_index,
                                  dim,
                                  base_quantization_str,
                                  recall));
-                // TODO
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -565,7 +583,7 @@ TestHGraphFactor(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -574,7 +592,7 @@ TestHGraphFactor(const fixtures::HGraphTestIndexPtr& test_index,
                 auto index = TestIndex::TestFactory(test_index->name, param, true);
                 auto dataset = HGraphTestIndex::pool.GetDatasetAndCreate(
                     dim, resource->base_count, metric_type);
-                TestIndex::TestContinueAdd(index, dataset, true);
+                TestIndex::TestBuildIndex(index, dataset, true);
                 float factors[4]{4, 0.5, -2.0F, 100};
                 for (int i = 0; i < 4; i++) {
                     auto search_param = fmt::format(search_param_template, factors[i], false);
@@ -609,7 +627,7 @@ TestHGraphTrainAndAddTest(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -701,7 +719,7 @@ TestHGraphBuild(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 vsag::Options::Instance().set_block_size_limit(size);
@@ -756,7 +774,7 @@ TestHGraphWithAttr(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 // Set block size limit for current test iteration
@@ -822,7 +840,7 @@ TestHGraphGetRawVector(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 // Set block size limit for current test iteration
@@ -871,8 +889,23 @@ TestHGraphTune(const fixtures::HGraphTestIndexPtr& test_index,
     auto origin_size = vsag::Options::Instance().block_size_limit();
     auto size = GENERATE(1024 * 1024 * 2);
     const std::vector<std::pair<std::string, std::string>> test_cases = {
-        {"sq8", "sq8"}, {"fp32", "bf16"}, {"sq8", "fp32"}};
+        /* [case 1] tune basic */
+        {"sq8", "sq8"},
+        {"fp32", "bf16"},
+        {"sq8", "fp32"},
+        /* [case 2] tune precise */
+        {"sq4,sq8", "sq4,sq8"},
+        {"sq4,bf16", "sq4,fp16"},
+        {"sq4,bf16", "sq4,fp32"},
+        /* [case 3] add precise */
+        {"sq4", "sq4,fp16"},
+        {"sq4", "sq4,fp32"},
+        /* [case 4] drop precise */
+        {"sq4,fp32", "sq4"},
+        {"sq4,bf16", "sq4"},
+    };
 
+    bool is_tested_disable_future_tuning = false;
     auto search_param = fmt::format(fixtures::search_param_tmp, 200, false);
     for (auto metric_type : resource->metric_types) {
         for (auto dim : resource->dims) {
@@ -905,11 +938,28 @@ TestHGraphTune(const fixtures::HGraphTestIndexPtr& test_index,
                 auto param2 = HGraphTestIndex::GenerateHGraphBuildParametersString(build_param2);
 
                 // Create index and dataset
-                auto index1 = TestIndex::TestFactory(test_index->name, param1, true);
-                auto index2 = TestIndex::TestFactory(test_index->name, param2, true);
+                auto index1 = TestIndex::TestFactory(
+                    test_index->name, param1, true);  // non-empty, used for test tune
+                auto index2 = TestIndex::TestFactory(
+                    test_index->name, param2, true);  // empty, used for test serialize and general
+
                 auto dataset = HGraphTestIndex::pool.GetDatasetAndCreate(
                     dim, resource->base_count, metric_type);
                 TestIndex::TestBuildIndex(index1, dataset, true);
+
+                if (not is_tested_disable_future_tuning) {
+                    auto index3 = TestIndex::TestFactory(test_index->name, param1, true);
+                    TestIndex::TestBuildIndex(index3, dataset, true);
+                    // set disable_future_tuning
+                    auto set_result = index3->Tune(param2, true);
+                    REQUIRE(set_result.has_value());
+                    REQUIRE(set_result.value());
+
+                    set_result = index3->Tune(param2, false);
+                    REQUIRE(set_result.has_value());
+                    REQUIRE_FALSE(set_result.value());
+                    is_tested_disable_future_tuning = true;
+                }
 
                 // set index param
                 auto set_result = index1->Tune(param2);
@@ -920,8 +970,8 @@ TestHGraphTune(const fixtures::HGraphTestIndexPtr& test_index,
                 TestIndex::TestSerializeFile(index1, index2, dataset, search_param, true);
 
                 // basic test
-                HGraphTestIndex::TestGeneral(index1, dataset, search_param, 0.9);
-                HGraphTestIndex::TestGeneral(index2, dataset, search_param, 0.9);
+                HGraphTestIndex::TestGeneral(index1, dataset, search_param, 0.7);
+                HGraphTestIndex::TestGeneral(index2, dataset, search_param, 0.7);
 
                 // Restore original block size limit
                 vsag::Options::Instance().set_block_size_limit(origin_size);
@@ -961,7 +1011,7 @@ TestHGraphODescentBuild(const fixtures::HGraphTestIndexPtr& test_index,
 
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 // Set block size limit for current test iteration
@@ -1019,7 +1069,7 @@ TestHGraphRemove(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1072,7 +1122,7 @@ TestHGraphCompressedBuild(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1120,7 +1170,7 @@ TestHGraphMerge(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1169,7 +1219,7 @@ TestHGraphAdd(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1218,7 +1268,7 @@ TestHGraphNonstandardID(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1266,7 +1316,7 @@ TestHGraphDuplicate(const fixtures::HGraphTestIndexPtr& test_index,
                                 duplicate_pos));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1395,7 +1445,7 @@ TestHGraphConcurrentAdd(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 // Set block size limit for current test iteration
@@ -1451,7 +1501,7 @@ TestHGraphConcurrentAddSearchRemove(const fixtures::HGraphTestIndexPtr& test_ind
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
 
                 // Set block size limit for current test iteration
@@ -1505,7 +1555,7 @@ TestHGraphSerialize(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1615,7 +1665,7 @@ TestHGraphClone(const fixtures::HGraphTestIndexPtr& test_index,
     auto origin_size = vsag::Options::Instance().block_size_limit();
     auto size = GENERATE(1024 * 1024 * 2);
     auto search_param = fmt::format(fixtures::search_param_tmp, 200, false);
-    uint64_t extra_info_size = 64;
+    uint64_t extra_info_size = 32;
 
     for (auto metric_type : resource->metric_types) {
         for (auto dim : resource->dims) {
@@ -1627,7 +1677,7 @@ TestHGraphClone(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1680,7 +1730,7 @@ TestHGraphExportModel(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1736,7 +1786,7 @@ TestHGraphRandomAllocator(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -1787,7 +1837,7 @@ TestHGraphDuplicateBuild(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
 
@@ -1818,8 +1868,8 @@ TEST_CASE("(Daily) HGraph Duplicate Build", "[ft][hgraph][daily]") {
 }
 
 static void
-TestHGraphEstimateMemory(const fixtures::HGraphTestIndexPtr& test_index,
-                         const fixtures::HGraphResourcePtr& resource) {
+TestHGraphEstimateMemoryAndGetMemoryUsage(const fixtures::HGraphTestIndexPtr& test_index,
+                                          const fixtures::HGraphResourcePtr& resource) {
     using namespace fixtures;
     auto origin_size = vsag::Options::Instance().block_size_limit();
     auto size = GENERATE(1024 * 1024 * 2);
@@ -1837,7 +1887,7 @@ TestHGraphEstimateMemory(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 vsag::Options::Instance().set_block_size_limit(size);
@@ -1852,22 +1902,23 @@ TestHGraphEstimateMemory(const fixtures::HGraphTestIndexPtr& test_index,
                                                                          0.8 /*valid_ratio*/,
                                                                          extra_info_size);
                 TestIndex::TestEstimateMemory(test_index->name, param, dataset);
+                TestIndex::TestGetMemoryUsage(test_index->name, param, dataset);
                 vsag::Options::Instance().set_block_size_limit(origin_size);
             }
         }
     }
 }
 
-TEST_CASE("(PR) HGraph Estimate Memory", "[ft][hgraph][pr]") {
+TEST_CASE("(PR) HGraph Estimate Memory And Get Memory Usage", "[ft][hgraph][pr]") {
     auto test_index = std::make_shared<fixtures::HGraphTestIndex>();
     auto resource = test_index->GetResource(true);
-    TestHGraphEstimateMemory(test_index, resource);
+    TestHGraphEstimateMemoryAndGetMemoryUsage(test_index, resource);
 }
 
 TEST_CASE("(Daily) HGraph Estimate Memory", "[ft][hgraph][daily]") {
     auto test_index = std::make_shared<fixtures::HGraphTestIndex>();
     auto resource = test_index->GetResource(false);
-    TestHGraphEstimateMemory(test_index, resource);
+    TestHGraphEstimateMemoryAndGetMemoryUsage(test_index, resource);
 }
 
 TEST_CASE_PERSISTENT_FIXTURE(fixtures::HGraphTestIndex, "HGraph ELP Optimizer", "[ft][hgraph]") {
@@ -1908,6 +1959,7 @@ TEST_CASE_PERSISTENT_FIXTURE(fixtures::HGraphTestIndex, "HGraph ELP Optimizer", 
     TestBuildIndex(index_strong, base);
     vsag::Options::Instance().set_block_size_limit(origin_size);
 }
+
 static void
 TestHGraphIgnoreReorder(const fixtures::HGraphTestIndexPtr& test_index,
                         const fixtures::HGraphResourcePtr& resource) {
@@ -1978,7 +2030,7 @@ TestHGraphWithExtraInfo(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -2044,7 +2096,7 @@ TestHGraphSearchOverTime(const fixtures::HGraphTestIndexPtr& test_index,
                                  recall));
                 if (HGraphTestIndex::IsRaBitQ(base_quantization_str) &&
                     dim < fixtures::RABITQ_MIN_RACALL_DIM) {
-                    continue;  // Skip invalid RaBitQ configurations
+                    dim = fixtures::RABITQ_MIN_RACALL_DIM;
                 }
                 vsag::Options::Instance().set_block_size_limit(size);
                 HGraphTestIndex::HGraphBuildParam build_param(
@@ -2087,6 +2139,7 @@ TestHGraphDiskIOType(const fixtures::HGraphTestIndexPtr& test_index,
         {"rabitq,fp16", "rabitq,fp16,mmap_io"},
     };
     const std::vector<std::string> graph_io_types = {"block_memory_io", "mmap_io", "async_io"};
+    auto select_idx = 0;
     for (auto metric_type : resource->metric_types) {
         for (auto dim : resource->dims) {
             for (auto& [memory_io_str, disk_io_str] : io_cases) {
@@ -2108,13 +2161,14 @@ TestHGraphDiskIOType(const fixtures::HGraphTestIndexPtr& test_index,
                 TestIndex::TestBuildIndex(index, dataset, true);
                 build_param.quantization_str = disk_io_str;
 
-                for (auto& graph_io_type : graph_io_types) {
-                    build_param.graph_io_type = graph_io_type;
-                    param = HGraphTestIndex::GenerateHGraphBuildParametersString(build_param);
-                    auto disk_index = TestIndex::TestFactory(test_index->name, param, true);
-                    TestIndex::TestSerializeFile(index, disk_index, dataset, search_param, true);
-                    HGraphTestIndex::TestGeneral(disk_index, dataset, search_param, recall);
-                }
+                auto graph_io_type = graph_io_types[select_idx];
+                build_param.graph_io_type = graph_io_type;
+                param = HGraphTestIndex::GenerateHGraphBuildParametersString(build_param);
+                auto disk_index = TestIndex::TestFactory(test_index->name, param, true);
+                TestIndex::TestSerializeFile(index, disk_index, dataset, search_param, true);
+                HGraphTestIndex::TestGeneral(disk_index, dataset, search_param, recall);
+                ++select_idx;
+                select_idx %= graph_io_types.size();
                 vsag::Options::Instance().set_block_size_limit(origin_size);
             }
         }

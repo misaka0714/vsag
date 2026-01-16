@@ -45,13 +45,28 @@ SINDIParameter::FromJson(const JsonType& json) {
         use_reorder = DEFAULT_USE_REORDER;
     }
 
+    if (json.Contains(USE_QUANTIZATION)) {
+        use_quantization = json[USE_QUANTIZATION].GetBool();
+    } else {
+        use_quantization = false;
+    }
+
     if (json.Contains(SPARSE_WINDOW_SIZE)) {
         window_size = json[SPARSE_WINDOW_SIZE].GetInt();
         CHECK_ARGUMENT(
-            (10'000 <= window_size and window_size <= 1'000'000),
-            fmt::format("window_size must in [10000, 1000000], but now is {}", window_size));
+            (10'000 <= window_size and window_size <= 60'000),
+            fmt::format("window_size must in [10000, 60000], but now is {}", window_size));
     } else {
         window_size = DEFAULT_WINDOW_SIZE;
+    }
+
+    if (json.Contains(SPARSE_AVG_DOC_TERM_LENGTH)) {
+        avg_doc_term_length = json[SPARSE_AVG_DOC_TERM_LENGTH].GetInt();
+        CHECK_ARGUMENT((0 < avg_doc_term_length),
+                       fmt::format("avg_doc_term_length must be greater than 0, but now is {}",
+                                   avg_doc_term_length));
+    } else {
+        avg_doc_term_length = DEFAULT_AVG_DOC_TERM_LENGTH;
     }
 
     if (json.Contains(SPARSE_DESERIALIZE_WITHOUT_FOOTER)) {
@@ -69,7 +84,9 @@ SINDIParameter::ToJson() const {
     json[SPARSE_TERM_ID_LIMIT].SetInt(term_id_limit);
     json[SPARSE_DOC_PRUNE_RATIO].SetFloat(doc_prune_ratio);
     json[USE_REORDER_KEY].SetBool(use_reorder);
+    json[USE_QUANTIZATION].SetBool(use_quantization);
     json[SPARSE_WINDOW_SIZE].SetInt(window_size);
+    json[SPARSE_AVG_DOC_TERM_LENGTH].SetInt(avg_doc_term_length);
     return json;
 }
 
@@ -89,6 +106,12 @@ SINDIParameter::CheckCompatibility(const vsag::ParamPtr& other) const {
         return false;
     }
     if (this->use_reorder != sindi_param->use_reorder) {
+        return false;
+    }
+    if (this->use_quantization != sindi_param->use_quantization) {
+        return false;
+    }
+    if (this->avg_doc_term_length != sindi_param->avg_doc_term_length) {
         return false;
     }
     return true;

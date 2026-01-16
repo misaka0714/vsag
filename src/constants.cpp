@@ -135,6 +135,7 @@ const char* const SERIALIZE_VERSION = "VERSION";
 const char* const SQ4_UNIFORM_TRUNC_RATE = "sq4_uniform_trunc_rate";
 const char* const RABITQ_PCA_DIM = "rabitq_pca_dim";
 const char* const RABITQ_BITS_PER_DIM_QUERY = "rabitq_bits_per_dim_query";
+const char* const RABITQ_BITS_PER_DIM_BASE = "rabitq_bits_per_dim_base";
 const char* const RABITQ_USE_FHT = "rabitq_use_fht";
 const char* const INDEX_TQ_CHAIN = "tq_chain";
 
@@ -188,6 +189,7 @@ const char* const IVF_BASE_IO_TYPE = "base_io_type";
 const char* const IVF_BASE_PQ_DIM = "base_pq_dim";
 const char* const IVF_BASE_FILE_PATH = "base_file_path";
 
+const char* const PYRAMID_SUPPORT_DUPLICATE = SUPPORT_DUPLICATE;
 const char* const PYRAMID_EF_CONSTRUCTION = EF_CONSTRUCTION_KEY;
 const char* const PYRAMID_USE_REORDER = USE_REORDER_KEY;
 const char* const PYRAMID_BASE_QUANTIZATION_TYPE = "base_quantization_type";

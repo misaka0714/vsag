@@ -178,6 +178,7 @@ TEST_CASE_PERSISTENT_FIXTURE(fixtures::SINDITestIndex, "SINDI Build and Search",
     TestGetMinAndMaxId(index, dataset, true);
     TestCalcDistanceById(index, dataset, 1e-4, true, true);
     TestBatchCalcDistanceById(index, dataset, 1e-4, true, true);
+    TestUpdateVectorSparse(index, dataset, true);
     TestUpdateId(index, dataset, search_param, true);
     TestEstimateMemory("sindi", build_param, dataset);
     TestIndexStatus(index);
@@ -227,4 +228,13 @@ TEST_CASE_PERSISTENT_FIXTURE(fixtures::SINDITestIndex, "SINDI Serialize File", "
         TestSerializeFile(index, index2, dataset, search_param, true);
     }
     vsag::Options::Instance().set_block_size_limit(origin_size);
+}
+
+TEST_CASE_PERSISTENT_FIXTURE(fixtures::SINDITestIndex, "Sindi Duplicate ID Test", "[ft][sindi]") {
+    fixtures::SINDIParam param;
+    param.use_reorder = GENERATE(true, false);
+    auto build_param = fixtures::SINDITestIndex::GenerateBuildParameter(param);
+    auto index = TestFactory("sindi", build_param, true);
+    auto dataset = pool.GetSparseDatasetAndCreate(base_count, 128, 0.8);
+    TestDuplicateAdd(index, dataset);
 }

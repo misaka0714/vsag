@@ -23,6 +23,7 @@
 #include <stdexcept>
 
 #include "algorithm/inner_index_interface.h"
+#include "analyzer/analyzer.h"
 #include "attr/argparse.h"
 #include "common.h"
 #include "datacell/sparse_graph_datacell.h"
@@ -42,6 +43,8 @@
 #include "vsag/options.h"
 
 namespace vsag {
+
+class HGraphAnalyzer;
 
 HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonParam& common_param)
     : InnerIndexInterface(hgraph_param, common_param),
@@ -70,26 +73,10 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
         GraphInterface::MakeInstance(hgraph_param->bottom_graph_param, common_param);
     mult_ = 1 / log(1.0 * static_cast<double>(this->bottom_graph_->MaximumDegree()));
 
-    auto step_block_size = Options::Instance().block_size_limit();
-    auto block_size_per_vector = this->basic_flatten_codes_->code_size_;
-    block_size_per_vector =
-        std::max(block_size_per_vector,
-                 static_cast<uint32_t>(this->bottom_graph_->maximum_degree_ * sizeof(InnerIdType)));
-    if (use_reorder_) {
-        block_size_per_vector =
-            std::max(block_size_per_vector, this->high_precise_codes_->code_size_);
-        reorder_ = std::make_shared<FlattenReorder>(this->high_precise_codes_, allocator_);
-    }
-    if (this->extra_infos_ != nullptr) {
-        block_size_per_vector =
-            std::max(block_size_per_vector, static_cast<uint32_t>(this->extra_info_size_));
-    }
-    auto increase_count = step_block_size / block_size_per_vector;
-    this->resize_increase_count_bit_ = std::max(
-        DEFAULT_RESIZE_BIT, static_cast<uint64_t>(log2(static_cast<double>(increase_count))));
+    init_resize_bit_and_reorder();
 
     this->parallel_searcher_ =
-        std::make_shared<ParallelSearcher>(common_param, build_pool_, neighbors_mutex_);
+        std::make_shared<ParallelSearcher>(common_param, thread_pool_, neighbors_mutex_);
 
     UnorderedMap<std::string, float> default_param(common_param.allocator_.get());
     default_param.insert(
@@ -115,13 +102,19 @@ HGraph::HGraph(const HGraphParameterPtr& hgraph_param, const vsag::IndexCommonPa
 }
 void
 HGraph::Train(const DatasetPtr& base) {
-    const auto* base_data = get_data(base);
-    this->basic_flatten_codes_->Train(base_data, base->GetNumElements());
+    int64_t total_elements = base->GetNumElements();
+    int64_t dim = base->GetDim();
+    DatasetPtr train_data =
+        vsag::sample_train_data(base, total_elements, dim, train_sample_count_, allocator_);
+
+    const auto* data_ptr = get_data(train_data);
+    this->basic_flatten_codes_->Train(data_ptr, train_data->GetNumElements());
     if (use_reorder_) {
-        this->high_precise_codes_->Train(base_data, base->GetNumElements());
+        this->high_precise_codes_->Train(data_ptr, train_data->GetNumElements());
     }
     if (create_new_raw_vector_) {
-        this->raw_vector_->Train(base_data, base->GetNumElements());
+        // nothing to do since raw_vector_ is fp32
+        this->raw_vector_->Train(data_ptr, train_data->GetNumElements());
     }
     // Train PCA transformer if needed
     if (this->pca_transformer_ != nullptr) {
@@ -394,6 +387,14 @@ HGraph::map_hgraph_param(const JsonType& hgraph_json) {
             },
         },
         {
+            RABITQ_BITS_PER_DIM_BASE,
+            {
+                BASE_CODES_KEY,
+                QUANTIZATION_PARAMS_KEY,
+                RABITQ_QUANTIZATION_BITS_PER_DIM_BASE_KEY,
+            },
+        },
+        {
             HGRAPH_BASE_PQ_DIM,
             {
                 BASE_CODES_KEY,
@@ -534,7 +535,8 @@ HGraph::map_hgraph_param(const JsonType& hgraph_json) {
 
 bool
 HGraph::Tune(const std::string& parameters, bool disable_future_tuning) {
-    if (not this->index_feature_list_->CheckFeature(IndexFeature::SUPPORT_TUNE)) {
+    if (not this->index_feature_list_->CheckFeature(IndexFeature::SUPPORT_TUNE) or
+        not this->has_raw_vector_) {
         return false;
     }
 
@@ -551,67 +553,96 @@ HGraph::Tune(const std::string& parameters, bool disable_future_tuning) {
     // construct param obj
     auto hgraph_parameter = std::make_shared<HGraphParameter>();
     hgraph_parameter->FromJson(inner_json);
+    auto inner_parameter = std::make_shared<InnerIndexParameter>();
+    inner_parameter->FromJson(inner_json);
 
-    // TODO(zxy): process high_precision_code
     // init new_basic_code obj
     auto common_param = this->basic_flatten_codes_->ExportCommonParam();
     auto new_basic_code =
         FlattenInterface::MakeInstance(hgraph_parameter->base_codes_param, common_param);
+    FlattenInterfacePtr new_precise_code;
+    if (inner_parameter->use_reorder) {
+        new_precise_code =
+            FlattenInterface::MakeInstance(hgraph_parameter->precise_codes_param, common_param);
+    }
 
-    // nothing need to do
-    if (basic_flatten_codes_->GetQuantizerName() == new_basic_code->GetQuantizerName()) {
-        return true;
+    std::scoped_lock lock(this->add_mutex_);
+
+    // check which code need to tune and update create_param_ptr_
+    bool is_tune_base_code = false;
+    bool is_tune_precise_code = false;
+    auto param = std::dynamic_pointer_cast<HGraphParameter>(create_param_ptr_);
+    if (basic_flatten_codes_->GetQuantizerName() != new_basic_code->GetQuantizerName()) {
+        // [case 1] base_code is not same
+        is_tune_base_code = true;
+    }
+    if (use_reorder_ and inner_parameter->use_reorder and
+        this->high_precise_codes_->GetQuantizerName() != new_precise_code->GetQuantizerName()) {
+        // [case 2] precise code is not same
+        is_tune_precise_code = true;
+    }
+    if (not inner_parameter->use_reorder) {
+        // [case 3] drop precise_code
+        use_reorder_ = false;
+        this->high_precise_codes_.reset();
+        param->precise_codes_param.reset();
+        is_tune_precise_code = false;
+    }
+    if (not use_reorder_ and inner_parameter->use_reorder) {
+        // [case 4] assign new precise_code
+        use_reorder_ = true;
+        is_tune_precise_code = true;
     }
 
     // update create_param_ptr_
-    std::scoped_lock lock(this->add_mutex_);
-    auto param = std::dynamic_pointer_cast<HGraphParameter>(create_param_ptr_);
-    param->base_codes_param = hgraph_parameter->base_codes_param;
+    if (is_tune_base_code) {
+        param->base_codes_param = hgraph_parameter->base_codes_param;
+    }
+    if (is_tune_precise_code) {
+        param->precise_codes_param = hgraph_parameter->precise_codes_param;
+    }
+    param->use_reorder = use_reorder_;
 
     // export train data and train new_basic_code
-    auto train_count = std::min(MAX_TRAIN_COUNT, (uint32_t)this->total_count_);
+    auto train_count = std::min(this->train_sample_count_, this->GetNumElements());
     Vector<float> train_data(train_count * dim_, 0, allocator_);
-    for (InnerIdType i = 0; i < train_count; i++) {
-        this->GetVectorByInnerId(i, (train_data.data() + i * dim_));
-    }
-    new_basic_code->Train(train_data.data(), train_count);
-
-    // insert data into new_basic_code
-    Vector<float> insert_buffer(dim_, 0, allocator_);
-    for (auto i = 0; i < this->total_count_; i++) {
-        this->GetVectorByInnerId(i, insert_buffer.data());
-        new_basic_code->InsertVector((const void*)insert_buffer.data(), i);
+    if (is_tune_base_code or is_tune_precise_code) {
+        for (InnerIdType i = 0; i < train_count; i++) {
+            this->GetVectorByInnerId(i, (train_data.data() + i * dim_));
+        }
     }
 
-    /**
-     * re-locate raw_vector logic (note that any != fp32):
-     * change basic:
-     * 1. quant1, any, fp32 -> quant2, any, fp32: no process
-     * 2. quant1, any, fp32 -> fp32, any, fp32: raw = basic
-     * 3. fp32, any, fp32 -> quant2, any, fp32: basic = quant2
-     *
-     * change high-precision
-     * 1. any, quant1, fp32 -> any, quant2, fp32: no process
-     * 2. any, quant1, fp32 -> any, fp32, fp32: raw = high
-     * 3. any, fp32, fp32 -> any, quant2, fp32: high = quant2
-     */
-    auto old_is_fp32 = basic_flatten_codes_->GetQuantizerName() == QUANTIZATION_TYPE_VALUE_FP32;
-    auto new_is_fp32 = new_basic_code->GetQuantizerName() == QUANTIZATION_TYPE_VALUE_FP32;
+    auto tune_and_rebuild =
+        [&](bool need_tune, FlattenInterfacePtr old_code, FlattenInterfacePtr new_code) {
+            if (not need_tune) {
+                return old_code;
+            }
 
-    if (!old_is_fp32 && new_is_fp32) {
-        // case 2: quant -> fp32
-        this->basic_flatten_codes_ = new_basic_code;
-        this->raw_vector_ = new_basic_code;
-        create_new_raw_vector_ = false;
-        has_raw_vector_ = true;
-    } else {  // quant -> quant OR fp32 -> quant
-        // case 1 and 3
-        this->basic_flatten_codes_ = new_basic_code;
-        create_new_raw_vector_ = true;
-        has_raw_vector_ = true;
-    }
+            new_code->Train(train_data.data(), train_count);
+
+            Vector<float> insert_buffer(dim_, 0, allocator_);
+            for (int64_t i = 0; i < total_count_; ++i) {
+                GetVectorByInnerId(i, insert_buffer.data());
+                new_code->InsertVector(static_cast<const void*>(insert_buffer.data()), i);
+            }
+            return new_code;
+        };
+
+    basic_flatten_codes_ =
+        tune_and_rebuild(is_tune_base_code, basic_flatten_codes_, new_basic_code);
+    high_precise_codes_ =
+        tune_and_rebuild(is_tune_precise_code, high_precise_codes_, new_precise_code);
+
+    check_and_init_raw_vector(param->raw_vector_param, common_param, false);
+    init_resize_bit_and_reorder();
 
     // set status
+    if (disable_future_tuning) {
+        this->index_feature_list_->SetFeature(IndexFeature::SUPPORT_TUNE, false);
+        this->raw_vector_.reset();
+        has_raw_vector_ = false;
+        create_new_raw_vector_ = false;
+    }
     return true;
 }
 
@@ -660,14 +691,15 @@ HGraph::build_by_odescent(const DatasetPtr& data) {
                                                             : this->basic_flatten_codes_;
     {
         odescent_param_->max_degree = bottom_graph_->MaximumDegree();
-        ODescent odescent_builder(odescent_param_, build_data, allocator_, this->build_pool_.get());
+        ODescent odescent_builder(
+            odescent_param_, build_data, allocator_, this->thread_pool_.get());
         odescent_builder.Build();
         odescent_builder.SaveGraph(bottom_graph_);
     }
     for (auto& route_graph_id : route_graph_ids) {
         odescent_param_->max_degree = bottom_graph_->MaximumDegree() / 2;
         ODescent sparse_odescent_builder(
-            odescent_param_, build_data, allocator_, this->build_pool_.get());
+            odescent_param_, build_data, allocator_, this->thread_pool_.get());
         auto graph = this->generate_one_route_graph();
         sparse_odescent_builder.Build(route_graph_id);
         sparse_odescent_builder.SaveGraph(graph);
@@ -749,15 +781,15 @@ HGraph::Add(const DatasetPtr& data) {
         if (attr_sets != nullptr) {
             cur_attr_set = attr_sets + local_idx;
         }
-        if (this->build_pool_ != nullptr) {
-            auto future = this->build_pool_->GeneralEnqueue(
+        if (this->thread_pool_ != nullptr) {
+            auto future = this->thread_pool_->GeneralEnqueue(
                 add_func, get_data(data, local_idx), level, inner_id, extra_info, cur_attr_set);
             futures.emplace_back(std::move(future));
         } else {
             add_func(get_data(data, local_idx), level, inner_id, extra_info, cur_attr_set);
         }
     }
-    if (this->build_pool_ != nullptr) {
+    if (this->thread_pool_ != nullptr) {
         for (auto& future : futures) {
             future.get();
         }
@@ -885,7 +917,7 @@ HGraph::KnnSearch(const DatasetPtr& query,
     }
 
     if (use_reorder_) {
-        this->reorder(query_data, this->high_precise_codes_, search_result, k);
+        this->reorder(query_data, this->high_precise_codes_, search_result, k, iter_filter_ctx);
     }
 
     while (search_result->Size() > k) {
@@ -902,7 +934,8 @@ HGraph::KnnSearch(const DatasetPtr& query,
     auto [dataset_results, dists, ids] = create_fast_dataset(count, search_allocator);
     char* extra_infos = nullptr;
     if (extra_info_size_ > 0) {
-        extra_infos = (char*)search_allocator->Allocate(extra_info_size_ * search_result->Size());
+        extra_infos = static_cast<char*>(
+            search_allocator->Allocate(extra_info_size_ * search_result->Size()));
         dataset_results->ExtraInfos(extra_infos);
     }
     for (int64_t j = count - 1; j >= 0; --j) {
@@ -1097,7 +1130,8 @@ HGraph::RangeSearch(const DatasetPtr& query,
     auto [dataset_results, dists, ids] = create_fast_dataset(count, allocator_);
     char* extra_infos = nullptr;
     if (extra_info_size_ > 0) {
-        extra_infos = (char*)allocator_->Allocate(extra_info_size_ * search_result->Size());
+        extra_infos =
+            static_cast<char*>(allocator_->Allocate(extra_info_size_ * search_result->Size()));
         dataset_results->ExtraInfos(extra_infos);
     }
     for (int64_t j = count - 1; j >= 0; --j) {
@@ -1357,6 +1391,7 @@ HGraph::Deserialize(StreamReader& reader) {
         if (this->use_attribute_filter_ and this->attr_filter_index_ != nullptr) {
             this->attr_filter_index_->Deserialize(reader);
         }
+        this->cal_memory_usage();
     } else {  // create like `else if ( ver in [v0.15, v0.17] )` here if need in the future
         logger::debug("parse with new version format");
 
@@ -1437,14 +1472,7 @@ HGraph::CalcDistanceById(const float* query, int64_t id) const {
     if (create_new_raw_vector_) {
         flat = this->raw_vector_;
     }
-    float result = 0.0F;
-    auto computer = flat->FactoryComputer(query);
-    {
-        std::shared_lock<std::shared_mutex> lock(this->label_lookup_mutex_);
-        auto new_id = this->label_table_->GetIdByLabel(id);
-        flat->Query(&result, computer, &new_id, 1);
-        return result;
-    }
+    return InnerIndexInterface::calc_distance_by_id(query, id, flat);
 }
 
 DatasetPtr
@@ -1456,29 +1484,7 @@ HGraph::CalDistanceById(const float* query, const int64_t* ids, int64_t count) c
     if (create_new_raw_vector_) {
         flat = this->raw_vector_;
     }
-    auto result = Dataset::Make();
-    result->Owner(true, allocator_);
-    auto* distances = (float*)allocator_->Allocate(sizeof(float) * count);
-    result->Distances(distances);
-    auto computer = flat->FactoryComputer(query);
-    Vector<InnerIdType> inner_ids(count, 0, allocator_);
-    Vector<InnerIdType> invalid_id_loc(allocator_);
-    {
-        std::shared_lock<std::shared_mutex> lock(this->label_lookup_mutex_);
-        for (int64_t i = 0; i < count; ++i) {
-            try {
-                inner_ids[i] = this->label_table_->GetIdByLabel(ids[i]);
-            } catch (std::runtime_error& e) {
-                logger::debug(fmt::format("failed to find id: {}", ids[i]));
-                invalid_id_loc.push_back(i);
-            }
-        }
-        flat->Query(distances, computer, inner_ids.data(), count);
-        for (unsigned int i : invalid_id_loc) {
-            distances[i] = -1;
-        }
-    }
-    return result;
+    return InnerIndexInterface::cal_distance_by_id(query, ids, count, flat);
 }
 
 std::pair<int64_t, int64_t>
@@ -1557,7 +1563,7 @@ HGraph::graph_add_one(const void* data, int level, InnerIdType inner_id) {
     param.ef = this->ef_construct_;
     param.topk = static_cast<int64_t>(ef_construct_);
     if (this->label_table_->CompressDuplicateData()) {
-        param.query_id = inner_id;
+        param.find_duplicate = true;
     }
 
     if (bottom_graph_->TotalCount() != 0) {
@@ -1622,7 +1628,6 @@ HGraph::resize(uint64_t new_size) {
         pool_ = std::make_shared<VisitedListPool>(1, allocator_, new_size_power_2, allocator_);
         this->label_table_->Resize(new_size_power_2);
         bottom_graph_->Resize(new_size_power_2);
-        this->max_capacity_.store(new_size_power_2);
         this->basic_flatten_codes_->Resize(new_size_power_2);
         if (use_reorder_) {
             this->high_precise_codes_->Resize(new_size_power_2);
@@ -1633,7 +1638,9 @@ HGraph::resize(uint64_t new_size) {
         if (this->extra_infos_ != nullptr) {
             this->extra_infos_->Resize(new_size_power_2);
         }
+        this->max_capacity_.store(new_size_power_2);
     }
+    this->cal_memory_usage();
 }
 void
 HGraph::InitFeatures() {
@@ -1672,6 +1679,7 @@ HGraph::InitFeatures() {
     });
     // other
     this->index_feature_list_->SetFeatures({IndexFeature::SUPPORT_ESTIMATE_MEMORY,
+                                            IndexFeature::SUPPORT_GET_MEMORY_USAGE,
                                             IndexFeature::SUPPORT_CHECK_ID_EXIST,
                                             IndexFeature::SUPPORT_CLONE,
                                             IndexFeature::SUPPORT_EXPORT_MODEL,
@@ -1745,13 +1753,14 @@ void
 HGraph::reorder(const void* query,
                 const FlattenInterfacePtr& flatten,
                 DistHeapPtr& candidate_heap,
-                int64_t k) const {
+                int64_t k,
+                IteratorFilterContext* iter_ctx) const {
     uint64_t size = candidate_heap->Size();
     if (k <= 0) {
         k = static_cast<int64_t>(size);
     }
-    auto reorder_heap =
-        reorder_->Reorder(candidate_heap, static_cast<const float*>(query), k, allocator_);
+    auto reorder_heap = reorder_->Reorder(
+        candidate_heap, static_cast<const float*>(query), k, allocator_, iter_ctx);
     candidate_heap = reorder_heap;
 }
 
@@ -1986,14 +1995,15 @@ HGraph::Merge(const std::vector<MergeUnit>& merge_units) {
     }
     {
         odescent_param_->max_degree = bottom_graph_->MaximumDegree();
-        ODescent odescent_builder(odescent_param_, build_data, allocator_, this->build_pool_.get());
+        ODescent odescent_builder(
+            odescent_param_, build_data, allocator_, this->thread_pool_.get());
         odescent_builder.Build(bottom_graph_);
         odescent_builder.SaveGraph(bottom_graph_);
     }
     for (auto& graph : route_graphs_) {
         odescent_param_->max_degree = bottom_graph_->MaximumDegree() / 2;
         ODescent sparse_odescent_builder(
-            odescent_param_, build_data, allocator_, this->build_pool_.get());
+            odescent_param_, build_data, allocator_, this->thread_pool_.get());
         auto ids = graph->GetIds();
         sparse_odescent_builder.Build(ids, graph);
         sparse_odescent_builder.SaveGraph(graph);
@@ -2022,6 +2032,7 @@ HGraph::SetImmutable() {
     this->neighbors_mutex_.reset();
     this->neighbors_mutex_ = std::make_shared<EmptyMutex>();
     this->searcher_->SetMutexArray(this->neighbors_mutex_);
+    this->label_table_->use_reverse_map_ = false;
     STLUnorderedMap<LabelType, InnerIdType> empty_remap(allocator_);
     this->label_table_->label_remap_.swap(empty_remap);
     this->immutable_ = true;
@@ -2144,7 +2155,8 @@ HGraph::SearchWithRequest(const SearchRequest& request) const {
     auto [dataset_results, dists, ids] = create_fast_dataset(count, search_allocator);
     char* extra_infos = nullptr;
     if (extra_info_size_ > 0 && this->extra_infos_ != nullptr) {
-        extra_infos = (char*)search_allocator->Allocate(extra_info_size_ * search_result->Size());
+        extra_infos = static_cast<char*>(
+            search_allocator->Allocate(extra_info_size_ * search_result->Size()));
         dataset_results->ExtraInfos(extra_infos);
     }
     for (int64_t j = count - 1; j >= 0; --j) {
@@ -2179,166 +2191,51 @@ const static int64_t DEFAULT_TOPK = 100;
 
 std::string
 HGraph::GetStats() const {
-    JsonType stats;
-    int64_t topk = DEFAULT_TOPK;
-    uint64_t sample_size = std::min(QUERY_SAMPLE_SIZE, this->total_count_.load());
-    Vector<float> sample_base_datas(dim_ * sample_size, 0.0F, allocator_);
-    if (this->total_count_ == 0) {
-        stats["total_count"].SetInt(0);
-        return stats.Dump();
-    }
-    constexpr static const char* search_params_template = R"({{
-        "hgraph": {{
-            "ef_search": {}
-        }}
-    }})";
-    std::string search_params = fmt::format(search_params_template, ef_construct_);
-    stats["total_count"].SetInt(this->total_count_);
-    // duplicate rate
-    size_t duplicate_num = 0;
-    if (this->label_table_->CompressDuplicateData()) {
-        for (int i = 0; i < this->total_count_; ++i) {
-            if (this->label_table_->duplicate_records_[i] != nullptr) {
-                duplicate_num += this->label_table_->duplicate_records_[i]->duplicate_ids.size();
-            }
-        }
-    }
-    stats["duplicate_rate"].SetFloat(static_cast<float>(duplicate_num) /
-                                     static_cast<float>(this->total_count_));
-    stats["deleted_count"].SetInt(delete_count_.load());
-    this->analyze_graph_connection(stats);
-    this->analyze_graph_recall(stats, sample_base_datas, sample_size, topk, search_params);
-    this->analyze_quantizer(stats, sample_base_datas.data(), sample_size, topk, search_params);
+    AnalyzerParam analyzer_param(allocator_);
+    analyzer_param.topk = DEFAULT_TOPK;
+    analyzer_param.base_sample_size = std::min(QUERY_SAMPLE_SIZE, this->total_count_.load());
+    analyzer_param.search_params =
+        fmt::format(R"({{"hgraph": {{"ef_search": {}}}}})", ef_construct_);
+    auto analyzer = CreateAnalyzer(this, analyzer_param);
+    JsonType stats = analyzer->GetStats();
     return stats.Dump(4);
 }
 
 void
-HGraph::analyze_graph_recall(JsonType& stats,
-                             Vector<float>& data,
-                             uint64_t sample_data_size,
-                             int64_t topk,
-                             const std::string& search_param) const {
-    if (this->use_reorder_ && not this->high_precise_codes_->InMemory()) {
-        logger::info(
-            "analyze_graph_recall: high_precise_codes_ is not in memory, skip base recall test");
-        return;
+HGraph::init_resize_bit_and_reorder() {
+    auto step_block_size = Options::Instance().block_size_limit();
+    auto block_size_per_vector = this->basic_flatten_codes_->code_size_;
+    block_size_per_vector =
+        std::max(block_size_per_vector,
+                 static_cast<uint32_t>(this->bottom_graph_->maximum_degree_ * sizeof(InnerIdType)));
+    if (use_reorder_) {
+        block_size_per_vector =
+            std::max(block_size_per_vector, this->high_precise_codes_->code_size_);
+        reorder_ = std::make_shared<FlattenReorder>(this->high_precise_codes_, allocator_);
     }
-    // recall of "base" when searching for "base"
-    logger::info("analyze_graph_recall: sample_data_size = {}, topk = {}", sample_data_size, topk);
-    auto codes = this->use_reorder_ ? this->high_precise_codes_ : this->basic_flatten_codes_;
-    int64_t hit_count = 0;
-    size_t all_neighbor_count = 0;
-    int64_t hit_neighbor_count = 0;
-    float avg_distance_base = 0.0F;
-    for (uint64_t i = 0; i < sample_data_size; ++i) {
-        InnerIdType sample_id = rand() % this->total_count_;
-        GetVectorByInnerId(sample_id, data.data() + i * dim_);
-        // generate groundtruth
-        DistHeapPtr groundtruth = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
-        if (i % 10 == 0) {
-            logger::info("calculate groundtruth for sample {} of {}", i, i + 10);
-        }
-        for (uint64_t j = 0; j < this->total_count_; ++j) {
-            float dist = codes->ComputePairVectors(sample_id, j);
-            if (groundtruth->Size() < topk) {
-                groundtruth->Push({dist, j});
-            } else if (dist < groundtruth->Top().first) {
-                groundtruth->Push({dist, j});
-                groundtruth->Pop();
-            }
-        }
-        // neighbors of a point and the proximity relationship of a point
-        Vector<InnerIdType> neighbors(allocator_);
-        this->bottom_graph_->GetNeighbors(sample_id, neighbors);
-        size_t neighbor_size = neighbors.size();
-        UnorderedSet<LabelType> groundtruth_ids(allocator_);
-        UnorderedSet<LabelType> neighbor_groundtruth_ids(allocator_);
-        while (not groundtruth->Empty()) {
-            auto id = groundtruth->Top().second;
-            groundtruth_ids.insert(this->label_table_->GetLabelById(id));
-            if (groundtruth->Size() <= neighbor_size) {
-                neighbor_groundtruth_ids.insert(this->label_table_->GetLabelById(id));
-            }
-            avg_distance_base += groundtruth->Top().first;
-            groundtruth->Pop();
-        }
-        all_neighbor_count += neighbor_size;
-        for (const auto& id : neighbors) {
-            if (neighbor_groundtruth_ids.count(this->label_table_->GetLabelById(id)) > 0) {
-                hit_neighbor_count++;
-            }
-        }
-
-        // search
-        auto query = Dataset::Make();
-        query->Owner(false)->NumElements(1)->Float32Vectors(data.data() + i * dim_)->Dim(dim_);
-        auto result = this->KnnSearch(query, topk, search_param, nullptr);
-        // calculate recall
-        for (int64_t j = 0; j < result->GetDim(); ++j) {
-            auto id = result->GetIds()[j];
-            if (groundtruth_ids.count(id) > 0) {
-                hit_count++;
-            }
-        }
+    if (this->extra_infos_ != nullptr) {
+        block_size_per_vector =
+            std::max(block_size_per_vector, static_cast<uint32_t>(this->extra_info_size_));
     }
-    stats["recall_base"].SetFloat(static_cast<float>(hit_count) /
-                                  static_cast<float>(sample_data_size * topk));
-    stats["proximity_recall_neighbor"].SetFloat(static_cast<float>(hit_neighbor_count) /
-                                                static_cast<float>(all_neighbor_count));
-    stats["avg_distance_base"].SetFloat(avg_distance_base /
-                                        static_cast<float>(sample_data_size * (topk - 1)));
-}
-
-void
-HGraph::analyze_graph_connection(JsonType& stats) const {
-    // graph connection
-    Vector<bool> visited(total_count_, false, allocator_);
-    int64_t connect_components = 0;
-    if (this->label_table_->CompressDuplicateData()) {
-        for (int i = 0; i < this->total_count_; ++i) {
-            if (this->label_table_->duplicate_records_[i] != nullptr) {
-                for (const auto& dup_id :
-                     this->label_table_->duplicate_records_[i]->duplicate_ids) {
-                    visited[dup_id] = true;
-                }
-            }
-        }
-    }
-    for (int64_t i = 0; i < total_count_; ++i) {
-        if (not visited[i] and not this->label_table_->IsRemoved(i)) {
-            connect_components++;
-            int64_t component_size = 0;
-            std::queue<int64_t> q;
-            q.push(i);
-            visited[i] = true;
-            while (not q.empty()) {
-                auto node = q.front();
-                q.pop();
-                component_size++;
-                Vector<InnerIdType> neighbors(allocator_);
-                this->bottom_graph_->GetNeighbors(node, neighbors);
-                for (const auto& nb : neighbors) {
-                    if (not visited[nb] and not this->label_table_->IsRemoved(nb)) {
-                        visited[nb] = true;
-                        q.push(nb);
-                    }
-                }
-            }
-        }
-    }
-    stats["connect_components"].SetInt(connect_components);
+    auto increase_count = step_block_size / block_size_per_vector;
+    this->resize_increase_count_bit_ = std::max(
+        DEFAULT_RESIZE_BIT, static_cast<uint64_t>(log2(static_cast<double>(increase_count))));
 }
 
 void
 HGraph::check_and_init_raw_vector(const FlattenInterfaceParamPtr& raw_vector_param,
-                                  const IndexCommonParam& common_param) {
+                                  const IndexCommonParam& common_param,
+                                  bool is_create_new) {
     if (raw_vector_param == nullptr) {
         return;
     }
 
+    if (is_create_new) {
+        raw_vector_ = FlattenInterface::MakeInstance(raw_vector_param, common_param);
+    }
+
     if (basic_flatten_codes_->GetQuantizerName() != QUANTIZATION_TYPE_VALUE_FP32 and
         high_precise_codes_ == nullptr) {
-        raw_vector_ = FlattenInterface::MakeInstance(raw_vector_param, common_param);
         create_new_raw_vector_ = true;
         has_raw_vector_ = true;
         return;
@@ -2346,7 +2243,6 @@ HGraph::check_and_init_raw_vector(const FlattenInterfaceParamPtr& raw_vector_par
     if (basic_flatten_codes_->GetQuantizerName() != QUANTIZATION_TYPE_VALUE_FP32 and
         high_precise_codes_ != nullptr and
         high_precise_codes_->GetQuantizerName() != QUANTIZATION_TYPE_VALUE_FP32) {
-        raw_vector_ = FlattenInterface::MakeInstance(raw_vector_param, common_param);
         create_new_raw_vector_ = true;
         has_raw_vector_ = true;
         return;
@@ -2354,7 +2250,6 @@ HGraph::check_and_init_raw_vector(const FlattenInterfaceParamPtr& raw_vector_par
 
     auto io_type_name = raw_vector_param->io_parameter->GetTypeName();
     if (io_type_name != IO_TYPE_VALUE_BLOCK_MEMORY_IO and io_type_name != IO_TYPE_VALUE_MEMORY_IO) {
-        raw_vector_ = FlattenInterface::MakeInstance(raw_vector_param, common_param);
         create_new_raw_vector_ = true;
         has_raw_vector_ = true;
         return;
@@ -2372,18 +2267,6 @@ HGraph::check_and_init_raw_vector(const FlattenInterfaceParamPtr& raw_vector_par
         has_raw_vector_ = true;
         return;
     }
-}
-
-bool
-HGraph::UpdateId(int64_t old_id, int64_t new_id) {
-    if (old_id == new_id) {
-        return true;
-    }
-
-    std::scoped_lock label_lock(this->label_lookup_mutex_);
-    this->label_table_->UpdateLabel(old_id, new_id);
-
-    return true;
 }
 
 bool
@@ -2423,8 +2306,9 @@ HGraph::UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update) 
 
             float neighbor_dist = 0;
             try {
-                neighbor_dist = this->CalcDistanceById(
-                    (float*)new_base_vec, this->label_table_->GetLabelById(neighbor_inner_id));
+                neighbor_dist =
+                    this->CalcDistanceById(static_cast<float*>(new_base_vec),
+                                           this->label_table_->GetLabelById(neighbor_inner_id));
             } catch (const std::runtime_error& e) {
                 // incase that neighbor has been deleted
                 continue;
@@ -2447,82 +2331,43 @@ HGraph::UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update) 
 
 std::string
 HGraph::AnalyzeIndexBySearch(const SearchRequest& request) {
-    JsonType stats;
-    Vector<float> distances(this->total_count_, allocator_);
-    Vector<InnerIdType> ids(this->total_count_, allocator_);
-    std::iota(ids.begin(), ids.end(), 0);
-    auto codes = (this->use_reorder_) ? this->high_precise_codes_ : this->basic_flatten_codes_;
-    auto querys = request.query_;
-    auto topk = std::min(request.topk_, GetNumElements());
-
-    int64_t num_elements = querys->GetNumElements();
-    DistHeapPtr heap = std::make_shared<StandardHeap<true, false>>(allocator_, -1);
-    Vector<UnorderedSet<InnerIdType>> ground_truths(
-        num_elements, UnorderedSet<InnerIdType>(allocator_), allocator_);
-    float dist = 0.0F;
-    for (int64_t i = 0; i < num_elements; i++) {
-        const auto* query_data = get_data(querys, i);
-        auto computer = codes->FactoryComputer(query_data);
-        if (i % 10 == 0) {
-            logger::info("calculate groundtruth for query data {} of {}", i, i + 10);
-        }
-        codes->Query(distances.data(), computer, ids.data(), this->total_count_);
-        for (int64_t j = 0; j < this->total_count_; ++j) {
-            if (heap->Size() < topk) {
-                heap->Push({distances[j], ids[j]});
-            } else if (distances[j] < heap->Top().first) {
-                heap->Push({distances[j], ids[j]});
-                heap->Pop();
-            }
-        }
-        while (not heap->Empty()) {
-            ground_truths[i].insert(heap->Top().second);
-            dist += heap->Top().first;
-            heap->Pop();
-        }
-    }
-    dist /= static_cast<float>(num_elements * topk);
-    stats["avg_distance_query"].SetFloat(dist);
-    auto param_str = request.params_str_;
-    double time_cost = 0.0;
-    int64_t result_hit = 0;
-    for (int64_t i = 0; i < num_elements; ++i) {
-        auto query = Dataset::Make();
-        query->NumElements(1)
-            ->Dim(dim_)
-            ->Float32Vectors((const float*)get_data(querys, i))
-            ->Owner(false);
-        DatasetPtr search_result;
-        double single_query_time;
-        {
-            Timer t(single_query_time);
-            search_result = this->KnnSearch(query, topk, param_str, nullptr);
-        }
-        if (search_result->GetDim() != topk) {
-            logger::error(
-                "search result size mismatch: expected {}, got {}", topk, search_result->GetDim());
-            continue;
-        }
-        int64_t hit_count = 0;
-        for (int64_t j = 0; j < search_result->GetDim(); ++j) {
-            if (ground_truths[i].count(search_result->GetIds()[j]) > 0) {
-                hit_count++;
-            }
-        }
-        result_hit += hit_count;
-        time_cost += single_query_time;
-    }
-    stats["recall_query"].SetFloat(static_cast<float>(result_hit) /
-                                   static_cast<float>(num_elements * topk));
-    stats["time_cost_query"].SetFloat(static_cast<float>(time_cost) /
-                                      static_cast<float>(num_elements));
-    this->analyze_quantizer(stats, querys->GetFloat32Vectors(), num_elements, topk, param_str);
+    AnalyzerParam analyzer_param(allocator_);
+    analyzer_param.topk = request.topk_;
+    auto analyzer = CreateAnalyzer(this, analyzer_param);
+    JsonType stats = analyzer->AnalyzeIndexBySearch(request);
     return stats.Dump(4);
 }
 
 void
 HGraph::GetAttributeSetByInnerId(InnerIdType inner_id, AttributeSet* attr) const {
     this->attr_filter_index_->GetAttribute(0, inner_id, attr);
+}
+
+void
+HGraph::cal_memory_usage() {
+    auto memory = sizeof(HGraph);
+    memory += this->neighbors_mutex_->GetCurrentMemoryUsage();
+    memory += this->pool_->GetCurrentMemoryUsage();
+    memory += this->label_table_->GetCurrentMemoryUsage();
+    memory += this->basic_flatten_codes_->GetCurrentMemoryUsage();
+    memory += this->bottom_graph_->GetCurrentMemoryUsage();
+    for (auto& graph : this->route_graphs_) {
+        memory += graph->GetCurrentMemoryUsage();
+    }
+    if (use_reorder_) {
+        memory += this->high_precise_codes_->GetCurrentMemoryUsage();
+    }
+
+    if (this->extra_infos_ != nullptr and this->extra_info_size_ > 0) {
+        memory += this->extra_infos_->GetCurrentMemoryUsage();
+    }
+
+    if (this->create_new_raw_vector_ and this->raw_vector_ != nullptr) {
+        memory += raw_vector_->GetCurrentMemoryUsage();
+    }
+
+    std::unique_lock lock(this->memory_usage_mutex_);
+    this->current_memory_usage_.store(static_cast<int64_t>(memory));
 }
 
 }  // namespace vsag

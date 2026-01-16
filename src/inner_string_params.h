@@ -30,6 +30,7 @@ const char* const INDEX_TYPE_PYRAMID = "pyramid";
 
 const char* const TYPE_KEY = "type";
 const char* const USE_REORDER_KEY = "use_reorder";
+const char* const USE_QUANTIZATION = "use_quantization";
 const char* const EXTRA_INFO_KEY = "extra_info";
 const char* const USE_ATTRIBUTE_FILTER_KEY = "use_attribute_filter";
 const char* const BUILD_THREAD_COUNT_KEY = "build_thread_count";
@@ -95,6 +96,7 @@ const char* const USE_FHT_KEY = "use_fht";
 // quantization param
 const char* const TQ_CHAIN_KEY = "tq_chain";
 const char* const RABITQ_QUANTIZATION_BITS_PER_DIM_QUERY_KEY = "rabitq_bits_per_dim_query";
+const char* const RABITQ_QUANTIZATION_BITS_PER_DIM_BASE_KEY = "rabitq_bits_per_dim_base";
 const char* const SQ4_UNIFORM_QUANTIZATION_TRUNC_RATE_KEY = "sq4_uniform_trunc_rate";
 const char* const PRODUCT_QUANTIZATION_DIM_KEY = "pq_dim";
 const char* const PRODUCT_QUANTIZATION_BITS_KEY = "pq_bits";
@@ -109,6 +111,7 @@ const char* const SPARSE_WINDOW_SIZE = "window_size";
 const char* const SPARSE_DESERIALIZE_WITHOUT_FOOTER = "deserialize_without_footer";
 const char* const SPARSE_DESERIALIZE_WITHOUT_BUFFER = "deserialize_without_buffer";
 const char* const SPARSE_USE_TERM_LISTS_HEAP_INSERT = "use_term_lists_heap_insert";
+const char* const SPARSE_AVG_DOC_TERM_LENGTH = "avg_doc_term_length";
 
 // graph param value
 const char* const GRAPH_PARAM_MAX_DEGREE_KEY = "max_degree";
@@ -133,7 +136,8 @@ const char* const IVF_TRAIN_TYPE_KEY = "ivf_train_type";
 const char* const IVF_TRAIN_TYPE_RANDOM = "random";
 const char* const IVF_TRAIN_TYPE_KMEANS = "kmeans";
 
-const char* const IVF_TRAIN_SAMPLE_COUNT_KEY = "ivf_train_sample_count";
+const char* const TRAIN_SAMPLE_COUNT_KEY =
+    "train_sample_count";  // used after v0.18 for both Hgraph and IVF
 const char* const IVF_PARTITION_STRATEGY_PARAMS_KEY = "partition_strategy";
 const char* const IVF_PARTITION_STRATEGY_TYPE_KEY = "partition_strategy_type";
 const char* const IVF_PARTITION_STRATEGY_TYPE_NEAREST = "ivf";

@@ -51,6 +51,8 @@ public:
     CheckAndMappingExternalParam(const JsonType& external_param,
                                  const IndexCommonParam& common_param);
 
+    friend class HGraphAnalyzer;
+
 public:
     HGraph(const HGraphParameterPtr& param, const IndexCommonParam& common_param);
 
@@ -91,11 +93,6 @@ public:
 
     void
     GetCodeByInnerId(InnerIdType inner_id, uint8_t* data) const override;
-
-    int64_t
-    GetMemoryUsage() const override {
-        return static_cast<int64_t>(this->CalSerializeSize());
-    }
 
     std::string
     GetMemoryUsageDetail() const override;
@@ -181,7 +178,7 @@ public:
     void
     SetBuildThreadsCount(uint64_t count) {
         this->build_thread_count_ = count;
-        this->build_pool_->SetPoolSize(count);
+        this->thread_pool_->SetPoolSize(count);
     }
 
     void
@@ -192,9 +189,6 @@ public:
 
     void
     Train(const DatasetPtr& base) override;
-
-    bool
-    UpdateId(int64_t old_id, int64_t new_id) override;
 
     bool
     UpdateVector(int64_t id, const DatasetPtr& new_base, bool force_update = false) override;
@@ -301,7 +295,8 @@ private:
     reorder(const void* query,
             const FlattenInterfacePtr& flatten,
             DistHeapPtr& candidate_heap,
-            int64_t k) const;
+            int64_t k,
+            IteratorFilterContext* iter_ctx = nullptr) const;
 
     void
     elp_optimize();
@@ -317,18 +312,15 @@ private:
 
 private:
     void
-    analyze_graph_recall(JsonType& stats,
-                         Vector<float>& data,
-                         uint64_t sample_data_size,
-                         int64_t topk,
-                         const std::string& search_param) const;
-
-    void
-    analyze_graph_connection(JsonType& stats) const;
-
-    void
     check_and_init_raw_vector(const FlattenInterfaceParamPtr& raw_vector_param,
-                              const IndexCommonParam& common_param);
+                              const IndexCommonParam& common_param,
+                              bool is_create_new = true);
+
+    void
+    init_resize_bit_and_reorder();
+
+    void
+    cal_memory_usage();
 
 private:
     FlattenInterfacePtr basic_flatten_codes_{nullptr};

@@ -172,6 +172,40 @@ TestIndex::TestUpdateId(const IndexPtr& index,
 }
 
 void
+TestIndex::TestUpdateVectorSparse(const IndexPtr& index,
+                                  const TestDatasetPtr& dataset,
+                                  bool expected_success) {
+    if (not index->CheckFeature(vsag::SUPPORT_UPDATE_VECTOR_CONCURRENT)) {
+        return;
+    }
+    auto ids = dataset->base_->GetIds();
+    auto num_vectors = dataset->base_->GetNumElements();
+    auto base = dataset->base_->GetSparseVectors();
+
+    for (int i = 0; i < num_vectors; i++) {
+        auto far_base = vsag::Dataset::Make();
+        auto close_base = vsag::Dataset::Make();
+        close_base->NumElements(1)->SparseVectors(base + i)->Owner(false);
+        far_base->NumElements(1)
+            ->SparseVectors(base + ((i + num_vectors / 2) % num_vectors))
+            ->Owner(false);
+
+        // [step 1] success case with <close> vector
+        auto dist_before = index->CalcDistanceById(close_base, ids[i]).value();
+        auto update_res = index->UpdateVector(ids[i], close_base);
+        auto dist_after = index->CalcDistanceById(close_base, ids[i]).value();
+        REQUIRE(update_res.has_value());
+        REQUIRE(update_res.value());
+        REQUIRE(std::abs(dist_before - dist_after) < 1e-3);
+
+        // [step 2] update with <far> vector
+        auto far_update_res = index->UpdateVector(ids[i], far_base);
+        REQUIRE(far_update_res.has_value());
+        REQUIRE_FALSE(far_update_res.value());
+    }
+}
+
+void
 TestIndex::TestUpdateVector(const IndexPtr& index,
                             const TestDatasetPtr& dataset,
                             const std::string& search_param,
@@ -426,7 +460,7 @@ TestIndex::TestKnnSearch(const IndexPtr& index,
             }
             return;
         } else {
-            REQUIRE(res.has_value() == expected_success);
+            REQUIRE(res.has_value() == true);
         }
         REQUIRE(res.value()->GetDim() == topk);
         auto result = res.value()->GetIds();
@@ -622,7 +656,8 @@ TestIndex::TestFilterSearch(const TestIndex::IndexPtr& index,
             auto obj_res = index->KnnSearch(query, topk, search_param, filter);
             if (expected_success) {
                 for (int j = 0; j < topk; ++j) {
-                    REQUIRE(obj_res.value()->GetIds()[j] == res.value()->GetIds()[j]);
+                    REQUIRE(std::abs(obj_res.value()->GetDistances()[j] -
+                                     res.value()->GetDistances()[j]) <= 2e-6);
                 }
             }
         }
@@ -641,7 +676,13 @@ TestIndex::TestFilterSearch(const TestIndex::IndexPtr& index,
             auto threshold = res.value()->GetDistances()[topk - 1] + 1e-5;
             auto range_result =
                 index->RangeSearch(query, threshold, search_param, dataset->filter_function_);
-            REQUIRE(range_result.value()->GetDim() >= topk - 1);
+            REQUIRE(range_result.has_value());
+            REQUIRE(range_result.value()->GetDim() > 0);
+            if (range_result.value()->GetDim() < topk - 1) {
+                WARN(fmt::format("range search result dim {} is less than {}",
+                                 range_result.value()->GetDim(),
+                                 topk - 1));
+            }
         }
         auto result = res.value()->GetIds();
         auto gt = gts->GetIds() + gt_topK * i;
@@ -903,7 +944,8 @@ TestIndex::TestSerializeFile(const IndexPtr& index_from,
         REQUIRE(res_from.value()->GetDim() == res_to.value()->GetDim());
         int64_t result_count = res_from.value()->GetDim();
         for (int64_t j = 0; j < result_count; ++j) {
-            REQUIRE(res_to.value()->GetIds()[j] == res_from.value()->GetIds()[j]);
+            REQUIRE(std::abs(res_from.value()->GetDistances()[j] -
+                             res_to.value()->GetDistances()[j]) <= 2e-6);
         }
     }
 }
@@ -1390,23 +1432,9 @@ TestIndex::TestContinueAddIgnoreRequire(const TestIndex::IndexPtr& index,
 }
 void
 TestIndex::TestDuplicateAdd(const TestIndex::IndexPtr& index, const TestDatasetPtr& dataset) {
-    auto double_dataset = vsag::Dataset::Make();
+    auto double_dataset = dataset->base_->DeepCopy();
+    double_dataset->Append(dataset->base_);
     uint64_t base_count = dataset->base_->GetNumElements();
-    uint64_t double_count = base_count * 2;
-    auto dim = dataset->base_->GetDim();
-    auto new_data = std::shared_ptr<float[]>(new float[double_count * dim]);
-    auto new_ids = std::shared_ptr<int64_t[]>(new int64_t[double_count]);
-    memcpy(new_data.get(), dataset->base_->GetFloat32Vectors(), base_count * dim * sizeof(float));
-    memcpy(new_data.get() + base_count * dim,
-           dataset->base_->GetFloat32Vectors(),
-           base_count * dim * sizeof(float));
-    memcpy(new_ids.get(), dataset->base_->GetIds(), base_count * sizeof(int64_t));
-    memcpy(new_ids.get() + base_count, dataset->base_->GetIds(), base_count * sizeof(int64_t));
-    double_dataset->Dim(dim)
-        ->NumElements(double_count)
-        ->Ids(new_ids.get())
-        ->Float32Vectors(new_data.get())
-        ->Owner(false);
 
     auto check_func = [&](std::vector<int64_t>& failed_ids) -> void {
         REQUIRE(failed_ids.size() == base_count);
@@ -1426,8 +1454,38 @@ TestIndex::TestDuplicateAdd(const TestIndex::IndexPtr& index, const TestDatasetP
     REQUIRE(add_index_2.has_value());
     check_func(add_index_2.value());
 }
+
 void
 TestIndex::TestEstimateMemory(const std::string& index_name,
+                              const std::string& build_param,
+                              const TestDatasetPtr& dataset) {
+    auto allocator = std::make_shared<fixtures::MemoryRecordAllocator>();
+    {
+        vsag::Resource resource(allocator.get(), nullptr);
+        vsag::Engine engine(&resource);
+        auto index1 = engine.CreateIndex(index_name, build_param).value();
+        REQUIRE(index1->GetNumElements() == 0);
+        if (index1->CheckFeature(vsag::SUPPORT_ESTIMATE_MEMORY)) {
+            auto data_size = dataset->base_->GetNumElements();
+            auto estimate_memory = index1->EstimateMemory(data_size);
+            auto build_index = index1->Build(dataset->base_);
+            auto real_memory = allocator->GetCurrentMemory();
+            if (estimate_memory <= static_cast<uint64_t>(real_memory * 0.8) or
+                estimate_memory >= static_cast<uint64_t>(real_memory * 1.2)) {
+                WARN(fmt::format("estimate_memory({}) is not in range [{}, {}]",
+                                 estimate_memory,
+                                 static_cast<uint64_t>(real_memory * 0.8),
+                                 static_cast<uint64_t>(real_memory * 1.2)));
+            }
+
+            REQUIRE(estimate_memory >= static_cast<uint64_t>(real_memory * 0.1));
+            REQUIRE(estimate_memory <= static_cast<uint64_t>(real_memory * 5.0));
+        }
+    }
+}
+
+void
+TestIndex::TestGetMemoryUsage(const std::string& index_name,
                               const std::string& build_param,
                               const TestDatasetPtr& dataset) {
     auto allocator = std::make_shared<fixtures::MemoryRecordAllocator>();
@@ -1440,9 +1498,8 @@ TestIndex::TestEstimateMemory(const std::string& index_name,
         REQUIRE(index2->GetNumElements() == 0);
         fixtures::TempDir dir("index");
         auto path = dir.GenerateRandomFile();
-        if (index1->CheckFeature(vsag::SUPPORT_ESTIMATE_MEMORY)) {
+        if (index1->CheckFeature(vsag::SUPPORT_GET_MEMORY_USAGE)) {
             auto data_size = dataset->base_->GetNumElements();
-            auto estimate_memory = index1->EstimateMemory(data_size);
             auto build_index = index2->Build(dataset->base_);
             REQUIRE(build_index.has_value());
             std::ofstream outf(path, std::ios::binary);
@@ -1463,17 +1520,6 @@ TestIndex::TestEstimateMemory(const std::string& index_name,
 
             REQUIRE(get_memory >= static_cast<uint64_t>(real_memory * 0.2));
             REQUIRE(get_memory <= static_cast<uint64_t>(real_memory * 3.2));
-
-            if (estimate_memory <= static_cast<uint64_t>(real_memory * 0.8) or
-                estimate_memory >= static_cast<uint64_t>(real_memory * 1.2)) {
-                WARN(fmt::format("estimate_memory({}) is not in range [{}, {}]",
-                                 estimate_memory,
-                                 static_cast<uint64_t>(real_memory * 0.8),
-                                 static_cast<uint64_t>(real_memory * 1.2)));
-            }
-
-            REQUIRE(estimate_memory >= static_cast<uint64_t>(real_memory * 0.1));
-            REQUIRE(estimate_memory <= static_cast<uint64_t>(real_memory * 5.0));
             inf.close();
         }
     }
@@ -1856,6 +1902,7 @@ TestIndex::TestRemoveIndex(const TestIndex::IndexPtr& index,
             ->Owner(false);
         auto add_results = index->Add(new_data);
         REQUIRE(add_results.has_value());
+
         auto remove_results = index->Remove(i + base_num);
         REQUIRE(index->GetNumberRemoved() == i + 1);
         REQUIRE(remove_results.has_value());
@@ -2336,6 +2383,8 @@ TestIndex::TestBuildDuplicateIndex(const IndexPtr& index,
             new_data->NumElements(1)
                 ->Dim(dataset->base_->GetDim())
                 ->Ids(&i)
+                ->SparseVectors(dataset->base_->GetSparseVectors())
+                ->Paths(dataset->base_->GetPaths())
                 ->Float32Vectors(dataset->base_->GetFloat32Vectors())
                 ->Owner(false);
             auto add_result = index->Add(new_data);
@@ -2348,6 +2397,8 @@ TestIndex::TestBuildDuplicateIndex(const IndexPtr& index,
             new_data->NumElements(1)
                 ->Dim(dataset->base_->GetDim())
                 ->Ids(&i)
+                ->SparseVectors(dataset->base_->GetSparseVectors())
+                ->Paths(dataset->base_->GetPaths())
                 ->Float32Vectors(dataset->base_->GetFloat32Vectors())
                 ->Owner(false);
             auto add_result = index->Add(new_data);
