@@ -15,6 +15,8 @@
 
 #include "hgraph_analyzer.h"
 
+#include <cstddef>
+
 #include "impl/heap/standard_heap.h"
 
 namespace vsag {
@@ -249,10 +251,9 @@ HGraphAnalyzer::SetQuery(const DatasetPtr& query) {
     query_sample_ids_.resize(query_sample_size_);
     query_sample_datas_.resize(static_cast<std::vector<float>::size_type>(query_sample_size_) *
                                static_cast<std::vector<float>::size_type>(dim_));
-    if (query->GetFloat32Vectors() != nullptr) {
-        std::memcpy(query_sample_datas_.data(),
-                    query->GetFloat32Vectors(),
-                    query_sample_size_ * dim_ * sizeof(float));
+    if (const float* query_vectors = query->GetFloat32Vectors()) {
+        std::memcpy(
+            query_sample_datas_.data(), query_vectors, static_cast<unsigned long>(query_sample_size_ * )dim_ * sizeof(float));
     } else {
         logger::error("Query dataset is empty or not float32");
         return false;
