@@ -161,10 +161,7 @@ parse_yaml_file(const std::string& yaml_file) {
                 std::cerr << "The root node is not a map!" << std::endl;
                 exit(-1);
             }
-        } catch (YAML::Exception& e) {
-            std::cerr << "Error parsing YAML: " << e.what() << std::endl;
-            exit(-1);
-        } catch (std::exception& e) {
+        } catch (const std::exception& e) {
             std::cerr << "Error parsing YAML: " << e.what() << std::endl;
             exit(-1);
         }
@@ -199,12 +196,6 @@ main(int argc, char** argv) {
                     auto single_result = eval_case->Run();
                     // Save to global results
                     results[name] = single_result;
-
-                    // If no exporters defined, print current progress to stdout
-                    if (job.exporters.empty()) {
-                        // We can print incremental results here if desired, but for now we skip to avoid spam
-                        // or we can implement a progress log
-                    }
                 }
             } catch (const std::exception& e) {
                 std::cerr << "case(" << name << ") error: " << e.what() << std::endl;
