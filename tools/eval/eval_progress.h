@@ -28,6 +28,13 @@ namespace vsag::eval {
 
 class ProgressBar {
 public:
+    ProgressBar(const ProgressBar&) = delete;
+    ProgressBar&
+    operator=(const ProgressBar&) = delete;
+    ProgressBar(ProgressBar&&) = delete;
+    ProgressBar&
+    operator=(ProgressBar&&) = delete;
+
     ProgressBar(std::string name, uint64_t total, uint64_t report_interval_ms = 1000)
         : name_(std::move(name)),
           total_(total),
@@ -79,6 +86,7 @@ public:
 private:
     void
     Print(bool force_end = false) {
+        std::lock_guard<std::mutex> lock(cout_mutex_);
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
         uint64_t cur = current_.load(std::memory_order_relaxed);
@@ -108,6 +116,7 @@ private:
     std::atomic<bool> running_;
     std::thread reporter_thread_;
     std::chrono::time_point<std::chrono::steady_clock> start_time_;
+    inline static std::mutex cout_mutex_;
 };
 
 }  // namespace vsag::eval
