@@ -164,6 +164,9 @@ parse_yaml_file(const std::string& yaml_file) {
         } catch (YAML::Exception& e) {
             std::cerr << "Error parsing YAML: " << e.what() << std::endl;
             exit(-1);
+        } catch (std::exception& e) {
+            std::cerr << "Error parsing YAML: " << e.what() << std::endl;
+            exit(-1);
         }
         // just separate YAML nodes by name
         cac.cases.emplace_back(std::make_pair<>(it->first.as<std::string>(), config));
@@ -186,31 +189,63 @@ main(int argc, char** argv) {
 
         vsag::eval::JsonType results;
         for (auto& [name, case_yaml_node] : job.cases) {
-            config = EvalConfig::Load(case_yaml_node, job);
-            vsag::Options::Instance().set_num_threads_building(config.num_threads_building);
+            try {
+                config = EvalConfig::Load(case_yaml_node, job);
+                vsag::Options::Instance().set_num_threads_building(config.num_threads_building);
 
-            auto eval_case = EvalCase::MakeInstance(config);
-            if (eval_case != nullptr) {
-                results[name] = eval_case->Run();
+                auto eval_case = EvalCase::MakeInstance(config);
+                if (eval_case != nullptr) {
+                    // Run one case
+                    auto single_result = eval_case->Run();
+                    // Save to global results
+                    results[name] = single_result;
+
+                    // Create a temporary results object containing only the current case
+                    // and export it immediately if needed (optional).
+                    // However, to ensure *all* results (accumulated) are saved even if program crashes later,
+                    // we should export the updated `results` map here.
+                    // But some exporters (like file overwrite) might be tricky if called multiple times.
+                    // Assuming standard usage is "Append" or "Overwrite with growing list".
+
+                    // For better UX, let's just print to stdout immediately if no exporters defined,
+                    // or if defined, try to export the incremental state.
+
+                    // NOTE: Repeatedly writing to the same file might be inefficient or wrong depending on Exporter impl.
+                    // A safer approach for now:
+                    // 1. Accumulate results.
+                    // 2. Export ALL accumulated results after EACH step.
+                    // This ensures if step 3 crashes, the file contains steps 1 & 2.
+
+                    // <format, formatted_results>
+                    std::unordered_map<std::string, std::string> cached_strings;
+                    for (const auto& exporter : job.exporters) {
+                        // convert at first time
+                        if (cached_strings.find(exporter.format) == cached_strings.end()) {
+                            cached_strings[exporter.format] =
+                                Formatter::Create(exporter.format)->Format(results);
+                        }
+                        std::string formatted_string = cached_strings[exporter.format];
+
+                        Exporter::Create(exporter.to, exporter.vars)->Export(formatted_string);
+                    }
+
+                    // If no exporters defined, print current progress to stdout
+                    if (job.exporters.empty()) {
+                        // To avoid flooding stdout with the whole table every time,
+                        // we might just want to print the latest result.
+                        vsag::eval::JsonType current_result_wrapper;
+                        current_result_wrapper[name] = single_result;
+                        // std::cout << Formatter::Create("table")->Format(current_result_wrapper) << std::endl;
+                        // Or just keep the end-of-loop behavior to avoid double printing.
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "case(" << name << ") error: " << e.what() << std::endl;
+                results[name]["error"] = e.what();
             }
         }
 
-        // <format, formatted_results>
-        std::unordered_map<std::string, std::string> cached_strings;
-        for (const auto& exporter : job.exporters) {
-            // std::cout << "export to " << exporter.to << " in " << exporter.format << std::endl;
-
-            // convert at first time
-            if (cached_strings.find(exporter.format) == cached_strings.end()) {
-                cached_strings[exporter.format] =
-                    Formatter::Create(exporter.format)->Format(results);
-            }
-            std::string formatted_string = cached_strings[exporter.format];
-
-            Exporter::Create(exporter.to, exporter.vars)->Export(formatted_string);
-        }
-
-        // by default, eval output as table/text format
+        // Final export (to catch empty exporters case specifically)
         if (job.exporters.empty()) {
             std::cout << Formatter::Create("table")->Format(results) << std::endl;
         }
