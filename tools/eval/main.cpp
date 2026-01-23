@@ -200,22 +200,6 @@ main(int argc, char** argv) {
                     // Save to global results
                     results[name] = single_result;
 
-                    // Create a temporary results object containing only the current case
-                    // and export it immediately if needed (optional).
-                    // However, to ensure *all* results (accumulated) are saved even if program crashes later,
-                    // we should export the updated `results` map here.
-                    // But some exporters (like file overwrite) might be tricky if called multiple times.
-                    // Assuming standard usage is "Append" or "Overwrite with growing list".
-
-                    // For better UX, let's just print to stdout immediately if no exporters defined,
-                    // or if defined, try to export the incremental state.
-
-                    // NOTE: Repeatedly writing to the same file might be inefficient or wrong depending on Exporter impl.
-                    // A safer approach for now:
-                    // 1. Accumulate results.
-                    // 2. Export ALL accumulated results after EACH step.
-                    // This ensures if step 3 crashes, the file contains steps 1 & 2.
-
                     // <format, formatted_results>
                     std::unordered_map<std::string, std::string> cached_strings;
                     for (const auto& exporter : job.exporters) {
@@ -231,12 +215,8 @@ main(int argc, char** argv) {
 
                     // If no exporters defined, print current progress to stdout
                     if (job.exporters.empty()) {
-                        // To avoid flooding stdout with the whole table every time,
-                        // we might just want to print the latest result.
                         vsag::eval::JsonType current_result_wrapper;
                         current_result_wrapper[name] = single_result;
-                        // std::cout << Formatter::Create("table")->Format(current_result_wrapper) << std::endl;
-                        // Or just keep the end-of-loop behavior to avoid double printing.
                     }
                 }
             } catch (const std::exception& e) {
