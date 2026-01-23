@@ -200,29 +200,29 @@ main(int argc, char** argv) {
                     // Save to global results
                     results[name] = single_result;
 
-                    // <format, formatted_results>
-                    std::unordered_map<std::string, std::string> cached_strings;
-                    for (const auto& exporter : job.exporters) {
-                        // convert at first time
-                        if (cached_strings.find(exporter.format) == cached_strings.end()) {
-                            cached_strings[exporter.format] =
-                                Formatter::Create(exporter.format)->Format(results);
-                        }
-                        std::string formatted_string = cached_strings[exporter.format];
-
-                        Exporter::Create(exporter.to, exporter.vars)->Export(formatted_string);
-                    }
-
                     // If no exporters defined, print current progress to stdout
                     if (job.exporters.empty()) {
-                        vsag::eval::JsonType current_result_wrapper;
-                        current_result_wrapper[name] = single_result;
+                        // We can print incremental results here if desired, but for now we skip to avoid spam
+                        // or we can implement a progress log
                     }
                 }
             } catch (const std::exception& e) {
                 std::cerr << "case(" << name << ") error: " << e.what() << std::endl;
                 results[name]["error"] = e.what();
             }
+        }
+
+        // <format, formatted_results>
+        std::unordered_map<std::string, std::string> cached_strings;
+        for (const auto& exporter : job.exporters) {
+            // convert at first time
+            if (cached_strings.find(exporter.format) == cached_strings.end()) {
+                cached_strings[exporter.format] =
+                    Formatter::Create(exporter.format)->Format(results);
+            }
+            std::string formatted_string = cached_strings[exporter.format];
+
+            Exporter::Create(exporter.to, exporter.vars)->Export(formatted_string);
         }
 
         // Final export (to catch empty exporters case specifically)
